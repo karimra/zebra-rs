@@ -264,6 +264,8 @@ pub struct LinkTop<'a> {
     /// pool the moment they learn about a new neighbor, without round-
     /// tripping back through the IS-IS instance.
     pub rib_client: &'a crate::rib::client::RibClient,
+    /// The instance's context, for the VRF stamped on state events.
+    pub ctx: &'a crate::context::ProtoContext,
     pub sr_locator: &'a Option<crate::rib::Locator>,
     pub watched_locator: &'a Option<String>,
     /// Per-Flex-Algorithm locator snapshots + watched names (mirrors
@@ -1280,6 +1282,16 @@ impl Isis {
 
             for sys_id in nbr_ids {
                 if let Some(nbr) = link.state.nbrs.get_mut(&level).get_mut(&sys_id) {
+                    super::nfsm::publish_adj_event(
+                        &self.ctx,
+                        &link.state.name,
+                        &self.hostname,
+                        level,
+                        nbr,
+                        nbr.state,
+                        super::nfsm::NfsmState::Down,
+                        "InterfaceDown",
+                    );
                     // Release SR-MPLS adjacency labels.
                     if let Some(local_pool) = self.local_pool.as_mut() {
                         for value in nbr.addr4.values_mut() {

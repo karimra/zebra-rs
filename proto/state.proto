@@ -31,6 +31,8 @@ enum EventKind {
   INTERFACE = 4;
   // IS-IS / OSPF shortest-path-first runs whose result was applied.
   SPF_RUN = 5;
+  // IS-IS adjacency state transitions.
+  ISIS_ADJACENCY = 6;
 }
 
 message SubscribeRequest {
@@ -67,6 +69,7 @@ message StateEvent {
     OspfNeighborEvent ospf_neighbor = 12;
     InterfaceEvent interface = 13;
     SpfRunEvent spf_run = 14;
+    IsisAdjacencyEvent isis_adjacency = 15;
   }
 }
 
@@ -182,6 +185,30 @@ message SpfRunEvent {
   uint64 duration_us = 4;
   // Nodes reached from this router, itself included.
   uint32 nodes_reached = 5;
+}
+
+// ISO 10589 §8.4 adjacency states.
+enum IsisAdjacencyState {
+  ISIS_ADJACENCY_STATE_UNSPECIFIED = 0;
+  ISIS_ADJACENCY_STATE_DOWN = 1;
+  ISIS_ADJACENCY_STATE_INIT = 2;
+  ISIS_ADJACENCY_STATE_UP = 3;
+}
+
+message IsisAdjacencyEvent {
+  // Neighbor system id ("0000.0000.0001").
+  string system_id = 1;
+  // Neighbor's dynamic hostname (RFC 5301) when known; else empty.
+  string hostname = 2;
+  string interface = 3;
+  // 1 or 2.
+  uint32 level = 4;
+  IsisAdjacencyState old_state = 5;
+  IsisAdjacencyState new_state = 6;
+  // Why the adjacency regressed: "HoldTimerExpired", "BfdDown",
+  // "InterfaceDown", or "NeighborLostUs" (the neighbor's hellos no
+  // longer list this router). Empty on forward progress.
+  string reason = 7;
 }
 
 // Operational state-change subscription service.

@@ -6,7 +6,8 @@ use tonic::Request;
 use pb::state_event::Event;
 use pb::state_service_client::StateServiceClient;
 use pb::{
-    BfdState, BgpState, EventKind, InterfaceChange, OspfNeighborState, StateEvent, SubscribeRequest,
+    BfdState, BgpState, EventKind, InterfaceChange, IsisAdjacencyState, OspfNeighborState,
+    StateEvent, SubscribeRequest,
 };
 
 pub mod pb {
@@ -21,7 +22,10 @@ fn parse_kind(name: &str) -> Result<EventKind> {
         "ospf" | "ospf-neighbor" => Ok(EventKind::OspfNeighbor),
         "interface" | "if" => Ok(EventKind::Interface),
         "spf" | "spf-run" => Ok(EventKind::SpfRun),
-        _ => bail!("unknown event family '{name}' (expected bgp, bfd, ospf, interface or spf)"),
+        "isis" | "isis-adjacency" => Ok(EventKind::IsisAdjacency),
+        _ => {
+            bail!("unknown event family '{name}' (expected bgp, bfd, ospf, isis, interface or spf)")
+        }
     }
 }
 
@@ -46,6 +50,12 @@ fn bfd_state(v: i32) -> String {
 fn ospf_state(v: i32) -> String {
     OspfNeighborState::try_from(v)
         .map(|s| state_name(s.as_str_name(), "OSPF_NEIGHBOR_STATE_"))
+        .unwrap_or_else(|_| v.to_string())
+}
+
+fn isis_state(v: i32) -> String {
+    IsisAdjacencyState::try_from(v)
+        .map(|s| state_name(s.as_str_name(), "ISIS_ADJACENCY_STATE_"))
         .unwrap_or_else(|_| v.to_string())
 }
 
@@ -130,6 +140,22 @@ fn format_event(ev: &StateEvent) -> String {
             format!(
                 "{} spf {scope} {} nodes in {} us",
                 r.protocol, r.nodes_reached, r.duration_us
+            )
+        }
+        Some(Event::IsisAdjacency(a)) => {
+            let host = if a.hostname.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", a.hostname)
+            };
+            format!(
+                "isis adjacency {}{host} on {} level-{} {} -> {}{}",
+                a.system_id,
+                a.interface,
+                a.level,
+                isis_state(a.old_state),
+                isis_state(a.new_state),
+                reason_suffix(&a.reason),
             )
         }
         None => "unknown event".to_string(),
@@ -217,6 +243,16 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "duration-us": r.duration_us,
             "nodes-reached": r.nodes_reached,
         }),
+        Some(Event::IsisAdjacency(a)) => json!({
+            "type": "isis-adjacency",
+            "system-id": a.system_id,
+            "hostname": a.hostname,
+            "interface": a.interface,
+            "level": a.level,
+            "old-state": isis_state(a.old_state),
+            "new-state": isis_state(a.new_state),
+            "reason": a.reason,
+        }),
         None => json!({ "type": "unknown" }),
     };
     json!({
@@ -263,6 +299,7 @@ mod tests {
         assert_eq!(parse_kind("ospf").unwrap(), EventKind::OspfNeighbor);
         assert_eq!(parse_kind("interface").unwrap(), EventKind::Interface);
         assert_eq!(parse_kind("spf").unwrap(), EventKind::SpfRun);
-        assert!(parse_kind("isis").is_err());
+        assert_eq!(parse_kind("isis").unwrap(), EventKind::IsisAdjacency);
+        assert!(parse_kind("rip").is_err());
     }
 }

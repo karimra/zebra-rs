@@ -618,6 +618,21 @@ pub fn hello_recv(link: &mut LinkTop, level: Level, pdu: IsisHello, mac: Option<
         state = NfsmState::Init;
     }
 
+    let reason = match (nbr.state, state) {
+        (NfsmState::Up, NfsmState::Init) if held => "BfdDown",
+        (NfsmState::Up, NfsmState::Init) => "NeighborLostUs",
+        _ => "",
+    };
+    super::nfsm::publish_adj_event(
+        link.ctx,
+        &link.state.name,
+        link.hostname,
+        level,
+        nbr,
+        nbr.state,
+        state,
+        reason,
+    );
     nbr.state = state;
 
     // Up→{Init,Down} regressed by the peer (TLV 6 no longer reports
@@ -888,6 +903,21 @@ pub fn hello_p2p_recv(link: &mut LinkTop, pdu: IsisP2pHello, mac: Option<MacAddr
             state = NfsmState::Init;
         }
 
+        let reason = match (nbr.state, state) {
+            (NfsmState::Up, NfsmState::Init) if held => "BfdDown",
+            (NfsmState::Up, NfsmState::Init) => "NeighborLostUs",
+            _ => "",
+        };
+        super::nfsm::publish_adj_event(
+            link.ctx,
+            &link.state.name,
+            link.hostname,
+            level,
+            nbr,
+            nbr.state,
+            state,
+            reason,
+        );
         nbr.state = state;
 
         // Same fast-converge as the LAN soft-down path: re-originate

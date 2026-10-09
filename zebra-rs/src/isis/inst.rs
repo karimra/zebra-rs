@@ -3475,6 +3475,7 @@ impl Isis {
             spf_timer: &mut self.spf_timer,
             spf_throttle: &mut self.spf_throttle,
             rib_client: &self.ctx.rib,
+            ctx: &self.ctx,
             sr_locator: &self.sr_locator,
             watched_locator: &self.watched_locator,
             sr_flex_algo_locators: &self.sr_flex_algo_locators_active,

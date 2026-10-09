@@ -48,6 +48,52 @@ pub fn nfsm_hold_timer(nbr: &Neighbor, level: Level) -> Timer {
     })
 }
 
+/// Publish a `zebra.state.v1` adjacency transition. Every site that
+/// sets `nbr.state` or drops a neighbor must call this, or subscribers
+/// miss the change. No-op when nothing changed or nobody watches.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_adj_event(
+    ctx: &crate::context::ProtoContext,
+    ifname: &str,
+    hostnames: &super::Levels<super::hostname::Hostname>,
+    level: Level,
+    nbr: &Neighbor,
+    old: NfsmState,
+    new: NfsmState,
+    reason: &str,
+) {
+    use crate::event::{self, EventKind, pb};
+
+    if old == new || !event::wants(EventKind::IsisAdjacency) {
+        return;
+    }
+    fn state(s: NfsmState) -> pb::IsisAdjacencyState {
+        match s {
+            NfsmState::Down => pb::IsisAdjacencyState::Down,
+            NfsmState::Init => pb::IsisAdjacencyState::Init,
+            NfsmState::Up => pb::IsisAdjacencyState::Up,
+        }
+    }
+    let hostname = hostnames
+        .get(&level)
+        .get(&nbr.sys_id)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default();
+    event::publish(
+        ctx.vrf_id(),
+        ctx.vrf_ifname().unwrap_or_default().to_string(),
+        event::Event::IsisAdjacency(pb::IsisAdjacencyEvent {
+            system_id: nbr.sys_id.to_string(),
+            hostname,
+            interface: ifname.to_string(),
+            level: level.digit() as u32,
+            old_state: state(old) as i32,
+            new_state: state(new) as i32,
+            reason: reason.to_string(),
+        }),
+    );
+}
+
 pub fn nbr_hold_timer_expire(
     link: &mut LinkTop,
     level: Level,
@@ -80,6 +126,20 @@ pub fn nbr_hold_timer_expire(
 
     let was_up = nbr.state == NfsmState::Up;
     let ifindex = nbr.ifindex;
+    publish_adj_event(
+        link.ctx,
+        &link.state.name,
+        link.hostname,
+        level,
+        nbr,
+        nbr.state,
+        NfsmState::Down,
+        if release_bfd {
+            "HoldTimerExpired"
+        } else {
+            "BfdDown"
+        },
+    );
     // Snapshot the peer's IPv4 and IPv6 link-local so we can send a BFD
     // Unsubscribe after dropping the nbr borrow. nbr's addr maps are about to
     // be wiped along with the entire entry below. Must be the same pick the
@@ -152,4 +212,79 @@ pub fn nbr_hold_timer_expire(
     }
 
     spf_schedule(link, level);
+}
+
+#[cfg(test)]
+mod state_event_tests {
+    use super::super::Levels;
+    use super::super::hostname::Hostname;
+    use super::super::link::NetworkType;
+    use super::*;
+    use crate::context::ProtoContext;
+    use crate::event::{self, EventKind, pb};
+
+    fn sys(b: u8) -> IsisSysId {
+        IsisSysId {
+            id: [0, 0, 0, 0, 0xee, b],
+        }
+    }
+
+    /// The hub is process-wide and tests run in parallel, so pick this
+    /// test's event out by its (unique) system id.
+    fn next_for(
+        rx: &mut tokio::sync::broadcast::Receiver<pb::StateEvent>,
+        sys_id: &str,
+    ) -> Option<pb::IsisAdjacencyEvent> {
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(event::Event::IsisAdjacency(a)) = ev.event
+                && a.system_id == sys_id
+            {
+                return Some(a);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn adjacency_down_carries_hostname_level_and_reason() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::IsisAdjacency]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let nbr = Neighbor::new(tx, 2, NetworkType::P2p, sys(1), None);
+        let mut hostnames: Levels<Hostname> = Levels::default();
+        hostnames.l2.insert(sys(1), "r2".into());
+        publish_adj_event(
+            &ProtoContext::default_table_no_rib(),
+            "eth0",
+            &hostnames,
+            Level::L2,
+            &nbr,
+            NfsmState::Up,
+            NfsmState::Down,
+            "HoldTimerExpired",
+        );
+        let a = next_for(&mut rx, &sys(1).to_string()).expect("Up -> Down event");
+        assert_eq!((a.hostname.as_str(), a.interface.as_str()), ("r2", "eth0"));
+        assert_eq!(a.level, 2);
+        assert_eq!(a.old_state, pb::IsisAdjacencyState::Up as i32);
+        assert_eq!(a.new_state, pb::IsisAdjacencyState::Down as i32);
+        assert_eq!(a.reason, "HoldTimerExpired");
+    }
+
+    #[tokio::test]
+    async fn unchanged_state_is_not_published() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::IsisAdjacency]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let nbr = Neighbor::new(tx, 2, NetworkType::P2p, sys(2), None);
+        publish_adj_event(
+            &ProtoContext::default_table_no_rib(),
+            "eth0",
+            &Levels::default(),
+            Level::L1,
+            &nbr,
+            NfsmState::Init,
+            NfsmState::Init,
+            "",
+        );
+        assert!(next_for(&mut rx, &sys(2).to_string()).is_none());
+    }
 }

@@ -92,7 +92,9 @@ enum Commands {
         #[arg(short, long, help = "One JSON object per event")]
         json: bool,
 
-        #[arg(help = "Event families to stream: bgp, bfd, ospf, interface, spf (omit for all)")]
+        #[arg(
+            help = "Event families to stream: bgp, bfd, ospf, isis, interface, spf (omit for all)"
+        )]
         families: Vec<String>,
     },
     /// Start MCP (Model Context Protocol) server for AI assistant integration
