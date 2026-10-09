@@ -489,6 +489,9 @@ pub enum AdjacencySid {
 pub struct OspfLink<V: OspfVersion = Ospfv2> {
     pub index: u32,
     pub name: String,
+    /// The owning instance's VRF, stamped on the state events this
+    /// link's neighbors publish (set by `link_add`).
+    pub vrf: crate::event::VrfTag,
     pub mtu: u32,
     pub enabled: bool,
     pub addr: Vec<OspfAddr<V>>,
@@ -630,6 +633,7 @@ where
         Self {
             index: link.index,
             name: link.name.to_owned(),
+            vrf: crate::event::VrfTag::default(),
             mtu: link.mtu,
             enabled: false,
             addr: Vec::new(),
@@ -696,6 +700,7 @@ where
         Self {
             index,
             name: format!("VLINK{}-{}", transit_area, peer_router_id),
+            vrf: crate::event::VrfTag::default(),
             mtu: 1500,
             enabled: true,
             addr: Vec::new(),

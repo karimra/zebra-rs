@@ -646,6 +646,50 @@ pub fn ospf_nfsm_inactivity_timer<V: OspfVersion>(
     ospf_nfsm_kill_nbr(oi, nbr, oident)
 }
 
+/// Publish a `zebra.state.v1` neighbor transition. `reason` explains
+/// a regression (the NFSM event, or why the neighbor was dropped).
+/// Every site that changes or discards a neighbor's state outside
+/// [`ospf_nfsm_change_state`] must call this, or subscribers miss it.
+pub fn publish_nbr_event<V: OspfVersion>(
+    vrf: &crate::event::VrfTag,
+    ifname: &str,
+    nbr: &Neighbor<V>,
+    old: NfsmState,
+    new: NfsmState,
+    reason: Option<&dyn Display>,
+) {
+    use crate::event::{self, EventKind, pb};
+
+    if old == new || !event::wants(EventKind::OspfNeighbor) {
+        return;
+    }
+    fn state(s: NfsmState) -> pb::OspfNeighborState {
+        use NfsmState::*;
+        match s {
+            Down => pb::OspfNeighborState::Down,
+            Init => pb::OspfNeighborState::Init,
+            TwoWay => pb::OspfNeighborState::TwoWay,
+            ExStart => pb::OspfNeighborState::ExStart,
+            Exchange => pb::OspfNeighborState::Exchange,
+            Loading => pb::OspfNeighborState::Loading,
+            Full => pb::OspfNeighborState::Full,
+        }
+    }
+    event::publish(
+        vrf.id,
+        vrf.name.clone(),
+        event::Event::OspfNeighbor(pb::OspfNeighborEvent {
+            version: if V::IPV6 { 3 } else { 2 },
+            router_id: nbr.ident.router_id.to_string(),
+            neighbor_address: V::prefix_ip(&nbr.ident.prefix).to_string(),
+            interface: ifname.to_string(),
+            old_state: state(old) as i32,
+            new_state: state(new) as i32,
+            reason: reason.map(|r| r.to_string()).unwrap_or_default(),
+        }),
+    );
+}
+
 fn ospf_nfsm_change_state<V: OspfVersion>(
     oi: &mut OspfInterface<V>,
     nbr: &mut Neighbor<V>,
@@ -666,6 +710,8 @@ fn ospf_nfsm_change_state<V: OspfVersion>(
         nbr.last_regressive = Some(Instant::now());
         nbr.last_regressive_reason = Some(event);
     }
+    let reason = (nbr.state < nbr.ostate).then_some(&event as &dyn Display);
+    publish_nbr_event(oi.vrf, oi.ifname, nbr, nbr.ostate, nbr.state, reason);
 
     if nbr.state < nbr.ostate {
         nbr.options = V::Options::default();
@@ -956,5 +1002,87 @@ mod db_summary_tests {
             listed(AreaTypeKind::Stub, false),
             set(&[Router, Network, Summary])
         );
+    }
+}
+
+#[cfg(test)]
+mod state_event_tests {
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    use ipnet::Ipv4Net;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::event::{self, EventKind, VrfTag, pb};
+
+    fn v2_neighbor(remote: &str, router_id: Ipv4Addr) -> Neighbor<Ospfv2> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        Neighbor::<Ospfv2>::new(
+            tx,
+            3,
+            Ipv4Net::from_str(remote).unwrap(),
+            &router_id,
+            40,
+            ptx,
+        )
+    }
+
+    /// The hub is process-wide and tests run in parallel, so pick this
+    /// test's event out by its (unique) router id.
+    fn next_for(
+        rx: &mut tokio::sync::broadcast::Receiver<pb::StateEvent>,
+        router_id: &str,
+    ) -> Option<(pb::StateEvent, pb::OspfNeighborEvent)> {
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(event::Event::OspfNeighbor(o)) = ev.event.clone()
+                && o.router_id == router_id
+            {
+                return Some((ev, o));
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn regression_carries_vrf_interface_and_reason() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::OspfNeighbor]);
+        let nbr = v2_neighbor("10.0.0.2/24", Ipv4Addr::new(10, 251, 0, 1));
+        let vrf = VrfTag {
+            id: 7,
+            name: "blue".into(),
+        };
+        publish_nbr_event(
+            &vrf,
+            "eth1",
+            &nbr,
+            NfsmState::Full,
+            NfsmState::Down,
+            Some(&NfsmEvent::InactivityTimer),
+        );
+        let (ev, o) = next_for(&mut rx, "10.251.0.1").expect("Full -> Down event");
+        assert_eq!((ev.vrf_id, ev.vrf.as_str()), (7, "blue"));
+        assert_eq!(o.version, 2);
+        assert_eq!(o.neighbor_address, "10.0.0.2");
+        assert_eq!(o.interface, "eth1");
+        assert_eq!(o.old_state, pb::OspfNeighborState::Full as i32);
+        assert_eq!(o.new_state, pb::OspfNeighborState::Down as i32);
+        assert_eq!(o.reason, "InactivityTimer");
+    }
+
+    #[tokio::test]
+    async fn unchanged_state_is_not_published() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::OspfNeighbor]);
+        let nbr = v2_neighbor("10.0.0.3/24", Ipv4Addr::new(10, 251, 0, 2));
+        publish_nbr_event(
+            &VrfTag::default(),
+            "eth1",
+            &nbr,
+            NfsmState::Down,
+            NfsmState::Down,
+            Some(&"InterfaceDown"),
+        );
+        assert!(next_for(&mut rx, "10.251.0.2").is_none());
     }
 }

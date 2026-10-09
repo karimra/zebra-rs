@@ -45,7 +45,11 @@ pub use pb::state_event::Event;
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// Every selectable family, the expansion of an empty `kinds` list.
-const ALL_KINDS: [EventKind; 2] = [EventKind::BgpPeer, EventKind::BfdSession];
+const ALL_KINDS: [EventKind; 3] = [
+    EventKind::BgpPeer,
+    EventKind::BfdSession,
+    EventKind::OspfNeighbor,
+];
 
 /// One slot per `EventKind` discriminant (slot 0, UNSPECIFIED, unused).
 const KIND_SLOTS: usize = ALL_KINDS.len() + 1;
@@ -134,6 +138,25 @@ impl Drop for Interest {
     }
 }
 
+/// A VRF identity for protocol state that outlives a single message
+/// handler (e.g. an OSPF link), so publishers deep in a state machine
+/// can tag events without reaching back to the instance's context.
+#[derive(Clone, Debug, Default)]
+pub struct VrfTag {
+    pub id: u32,
+    /// Empty for the default VRF.
+    pub name: String,
+}
+
+impl VrfTag {
+    pub fn of(ctx: &crate::context::ProtoContext) -> Self {
+        Self {
+            id: ctx.vrf_id(),
+            name: ctx.vrf_ifname().unwrap_or_default().to_string(),
+        }
+    }
+}
+
 /// Whether any subscriber selects `kind`. Gate payload construction
 /// on this; it is a single relaxed atomic load.
 pub fn wants(kind: EventKind) -> bool {
@@ -156,6 +179,7 @@ pub fn kind_of(event: &Event) -> EventKind {
     match event {
         Event::BgpPeer(_) => EventKind::BgpPeer,
         Event::BfdSession(_) => EventKind::BfdSession,
+        Event::OspfNeighbor(_) => EventKind::OspfNeighbor,
     }
 }
 

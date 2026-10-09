@@ -5,7 +5,7 @@ use tonic::Request;
 
 use pb::state_event::Event;
 use pb::state_service_client::StateServiceClient;
-use pb::{BfdState, BgpState, EventKind, StateEvent, SubscribeRequest};
+use pb::{BfdState, BgpState, EventKind, OspfNeighborState, StateEvent, SubscribeRequest};
 
 pub mod pb {
     tonic::include_proto!("zebra.state.v1");
@@ -16,7 +16,8 @@ fn parse_kind(name: &str) -> Result<EventKind> {
     match name {
         "bgp" | "bgp-peer" => Ok(EventKind::BgpPeer),
         "bfd" | "bfd-session" => Ok(EventKind::BfdSession),
-        _ => bail!("unknown event family '{name}' (expected bgp or bfd)"),
+        "ospf" | "ospf-neighbor" => Ok(EventKind::OspfNeighbor),
+        _ => bail!("unknown event family '{name}' (expected bgp, bfd or ospf)"),
     }
 }
 
@@ -38,6 +39,21 @@ fn bfd_state(v: i32) -> String {
         .unwrap_or_else(|_| v.to_string())
 }
 
+fn ospf_state(v: i32) -> String {
+    OspfNeighborState::try_from(v)
+        .map(|s| state_name(s.as_str_name(), "OSPF_NEIGHBOR_STATE_"))
+        .unwrap_or_else(|_| v.to_string())
+}
+
+/// ` reason: …` suffix, or nothing when there is no reason.
+fn reason_suffix(reason: &str) -> String {
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" reason: {reason}")
+    }
+}
+
 /// One event as a single human-readable line.
 fn format_event(ev: &StateEvent) -> String {
     let secs = ev.timestamp_ns / 1_000_000_000;
@@ -54,11 +70,7 @@ fn format_event(ev: &StateEvent) -> String {
             } else {
                 format!(" ({})", p.interface)
             };
-            let reason = if p.down_reason.is_empty() {
-                String::new()
-            } else {
-                format!(" reason: {}", p.down_reason)
-            };
+            let reason = reason_suffix(&p.down_reason);
             format!(
                 "bgp neighbor {}{ifname} AS{} {} -> {}{reason}",
                 p.peer_address,
@@ -75,6 +87,16 @@ fn format_event(ev: &StateEvent) -> String {
             bfd_state(b.old_state),
             bfd_state(b.new_state),
             b.diagnostic,
+        ),
+        Some(Event::OspfNeighbor(o)) => format!(
+            "{} neighbor {} ({}) on {} {} -> {}{}",
+            if o.version == 3 { "ospfv3" } else { "ospf" },
+            o.router_id,
+            o.neighbor_address,
+            o.interface,
+            ospf_state(o.old_state),
+            ospf_state(o.new_state),
+            reason_suffix(&o.reason),
         ),
         None => "unknown event".to_string(),
     };
@@ -136,6 +158,16 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "new-state": bfd_state(b.new_state),
             "diagnostic": b.diagnostic,
         }),
+        Some(Event::OspfNeighbor(o)) => json!({
+            "type": "ospf-neighbor",
+            "version": o.version,
+            "router-id": o.router_id,
+            "neighbor-address": o.neighbor_address,
+            "interface": o.interface,
+            "old-state": ospf_state(o.old_state),
+            "new-state": ospf_state(o.new_state),
+            "reason": o.reason,
+        }),
         None => json!({ "type": "unknown" }),
     };
     json!({
@@ -179,6 +211,7 @@ mod tests {
     fn family_names_parse() {
         assert_eq!(parse_kind("bgp").unwrap(), EventKind::BgpPeer);
         assert_eq!(parse_kind("bfd-session").unwrap(), EventKind::BfdSession);
-        assert!(parse_kind("ospf").is_err());
+        assert_eq!(parse_kind("ospf").unwrap(), EventKind::OspfNeighbor);
+        assert!(parse_kind("isis").is_err());
     }
 }

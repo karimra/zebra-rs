@@ -615,6 +615,9 @@ pub struct Ospf<V: OspfVersion = Ospfv2> {
 // Default V = Ospfv2 keeps function signatures unchanged at callsites.
 pub struct OspfInterface<'a, V: OspfVersion = Ospfv2> {
     pub tx: &'a UnboundedSender<Message<V>>,
+    /// The parent link's name and VRF, for neighbor state events.
+    pub ifname: &'a str,
+    pub vrf: &'a crate::event::VrfTag,
     pub router_id: &'a Ipv4Addr,
     /// Abandoned identities — see `OspfLink::former_router_ids`.
     pub former_router_ids: &'a [Ipv4Addr],
@@ -2097,6 +2100,8 @@ impl<V: OspfVersion> Ospf<V> {
                     (
                         OspfInterface {
                             tx: &self.tx,
+                            ifname: &link.name,
+                            vrf: &link.vrf,
                             router_id: &self.router_id,
                             former_router_ids: &link.former_router_ids,
                             ident: &link.ident,
@@ -2140,13 +2145,14 @@ impl<V: OspfVersion> Ospf<V> {
             return;
         }
         let name = link.name.clone();
-        let link = OspfLink::from(
+        let mut link = OspfLink::from(
             self.tx.clone(),
             link,
             self.sock.clone(),
             self.router_id,
             self.ptx.clone(),
         );
+        link.vrf = crate::event::VrfTag::of(&self.ctx);
         self.links.insert(link.index, link);
         self.interface_config_replay(&name);
     }
@@ -3494,6 +3500,7 @@ impl Ospf<Ospfv2> {
                     *transit,
                     *peer,
                 );
+                link.vrf = crate::event::VrfTag::of(&self.ctx);
                 // Intervals + authentication from the transit area's
                 // virtual-link config.
                 Self::vl_apply_config(&mut link, cfg);
@@ -6289,7 +6296,13 @@ impl Ospf<Ospfv2> {
     /// A later Hello re-creates the neighbor from `Down`, so clearing a
     /// live neighbor bounces the adjacency while a real timeout simply
     /// leaves it gone.
-    fn nfsm_kill_neighbor(&mut self, ifindex: u32, src: Ipv4Addr, old_state: Option<NfsmState>) {
+    fn nfsm_kill_neighbor(
+        &mut self,
+        ifindex: u32,
+        src: Ipv4Addr,
+        old_state: Option<NfsmState>,
+        ev: NfsmEvent,
+    ) {
         let Some(old_state) = old_state else {
             return;
         };
@@ -6302,6 +6315,16 @@ impl Ospf<Ospfv2> {
         };
 
         if let Some(link) = self.links.get_mut(&ifindex) {
+            if let Some(nbr) = link.nbrs.get(&src) {
+                super::nfsm::publish_nbr_event(
+                    &link.vrf,
+                    &link.name,
+                    nbr,
+                    old_state,
+                    NfsmState::Down,
+                    Some(&ev),
+                );
+            }
             link.nbrs.remove(&src);
         }
 
@@ -7864,7 +7887,7 @@ impl Ospf<Ospfv2> {
                     // caller will delete it" contract, left the actual
                     // removal to us; do it so the instance is really
                     // gone and a later Hello re-forms it from scratch.
-                    self.nfsm_kill_neighbor(index, src, old_state);
+                    self.nfsm_kill_neighbor(index, src, old_state, ev);
                 } else {
                     let new_state = self
                         .links
@@ -12291,7 +12314,7 @@ impl Ospf<Ospfv3> {
                     // expiry, BFD-down, or `clear ospfv3 neighbor`);
                     // `ospf_nfsm` reset its lists but leaves the actual
                     // removal to us. Mirrors the v2 sibling.
-                    self.nfsm_kill_neighbor(index, src, old_state);
+                    self.nfsm_kill_neighbor(index, src, old_state, ev);
                 } else {
                     let new_state = self
                         .links
@@ -13683,7 +13706,13 @@ impl Ospf<Ospfv3> {
     /// (Router-LSA / Network-LSA / SPF) and re-elect the DR if it had
     /// reached 2-Way. A later Hello re-creates the neighbor from
     /// `Down`.
-    fn nfsm_kill_neighbor(&mut self, ifindex: u32, src: Ipv4Addr, old_state: Option<NfsmState>) {
+    fn nfsm_kill_neighbor(
+        &mut self,
+        ifindex: u32,
+        src: Ipv4Addr,
+        old_state: Option<NfsmState>,
+        ev: NfsmEvent,
+    ) {
         let Some(old_state) = old_state else {
             return;
         };
@@ -13696,6 +13725,16 @@ impl Ospf<Ospfv3> {
         };
 
         if let Some(link) = self.links.get_mut(&ifindex) {
+            if let Some(nbr) = link.nbrs.get(&src) {
+                super::nfsm::publish_nbr_event(
+                    &link.vrf,
+                    &link.name,
+                    nbr,
+                    old_state,
+                    NfsmState::Down,
+                    Some(&ev),
+                );
+            }
             link.nbrs.remove(&src);
         }
 

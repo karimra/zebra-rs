@@ -24,6 +24,8 @@ enum EventKind {
   BGP_PEER = 1;
   // BFD session state transitions.
   BFD_SESSION = 2;
+  // OSPFv2 / OSPFv3 neighbor state transitions.
+  OSPF_NEIGHBOR = 3;
 }
 
 message SubscribeRequest {
@@ -57,6 +59,7 @@ message StateEvent {
   oneof event {
     BgpPeerEvent bgp_peer = 10;
     BfdSessionEvent bfd_session = 11;
+    OspfNeighborEvent ospf_neighbor = 12;
   }
 }
 
@@ -105,6 +108,33 @@ message BfdSessionEvent {
   BfdState new_state = 6;
   // Local diagnostic accompanying the change (RFC 5880 §4.1).
   string diagnostic = 7;
+}
+
+// RFC 2328 §10.1 neighbor states (OSPFv3 uses the same machine).
+enum OspfNeighborState {
+  OSPF_NEIGHBOR_STATE_UNSPECIFIED = 0;
+  OSPF_NEIGHBOR_STATE_DOWN = 1;
+  OSPF_NEIGHBOR_STATE_INIT = 2;
+  OSPF_NEIGHBOR_STATE_TWO_WAY = 3;
+  OSPF_NEIGHBOR_STATE_EX_START = 4;
+  OSPF_NEIGHBOR_STATE_EXCHANGE = 5;
+  OSPF_NEIGHBOR_STATE_LOADING = 6;
+  OSPF_NEIGHBOR_STATE_FULL = 7;
+}
+
+message OspfNeighborEvent {
+  // 2 for OSPFv2, 3 for OSPFv3.
+  uint32 version = 1;
+  string router_id = 2;
+  // Neighbor interface address (IPv4 for v2, link-local IPv6 for v3).
+  string neighbor_address = 3;
+  string interface = 4;
+  OspfNeighborState old_state = 5;
+  OspfNeighborState new_state = 6;
+  // What moved the neighbor backwards: the RFC 2328 §10.2 event
+  // ("InactivityTimer", "SeqNumberMismatch", "KillNbr", …),
+  // "InterfaceDown", or "RouterIdChange". Empty on forward progress.
+  string reason = 7;
 }
 
 // Operational state-change subscription service.
