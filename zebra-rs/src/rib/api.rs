@@ -373,8 +373,53 @@ impl Rib {
             .unwrap_or(0)
     }
 
+    /// Publish a `zebra.state.v1` interface event for `link`.
+    ///
+    /// Hooked into the plain fan-outs (`api_link_add`, `api_link_up`,
+    /// …), which run once per real kernel change. The `_vrf` variants
+    /// also replay links and addresses to subscribers when an
+    /// interface moves between VRFs, which is not a change to the
+    /// interface itself, so they do not publish.
+    fn publish_link_event(
+        &self,
+        link: &Link,
+        change: crate::event::pb::InterfaceChange,
+        address: Option<&IpNet>,
+    ) {
+        use crate::event::{self, EventKind, pb};
+
+        if !event::wants(EventKind::Interface) {
+            return;
+        }
+        event::publish(
+            self.link_vrf_id(link),
+            super::link::link_vrf_name(self, link)
+                .unwrap_or_default()
+                .to_string(),
+            event::Event::Interface(pb::InterfaceEvent {
+                name: link.name.clone(),
+                ifindex: link.index,
+                change: change as i32,
+                address: address.map(|a| a.to_string()).unwrap_or_default(),
+            }),
+        );
+    }
+
+    /// [`Self::publish_link_event`] for a link known by ifindex.
+    fn publish_ifindex_event(
+        &self,
+        ifindex: u32,
+        change: crate::event::pb::InterfaceChange,
+        address: Option<&IpNet>,
+    ) {
+        if let Some(link) = self.links.get(&ifindex) {
+            self.publish_link_event(link, change, address);
+        }
+    }
+
     /// Push `LinkAdd` only to subscribers bound to this link's VRF.
     pub fn api_link_add(&self, link: &Link) {
+        self.publish_link_event(link, crate::event::pb::InterfaceChange::Added, None);
         self.api_link_add_vrf(link, self.link_vrf_id(link));
     }
 
@@ -394,6 +439,7 @@ impl Rib {
     }
 
     pub fn api_link_up(&self, ifindex: u32) {
+        self.publish_ifindex_event(ifindex, crate::event::pb::InterfaceChange::Up, None);
         let vrf_id = self.ifindex_vrf_id(ifindex);
         for (_, sub) in self.client_registry.iter_link_subs(vrf_id) {
             let _ = sub.rib_rx_tx.send(RibRx::LinkUp(ifindex));
@@ -401,6 +447,7 @@ impl Rib {
     }
 
     pub fn api_link_down(&self, ifindex: u32) {
+        self.publish_ifindex_event(ifindex, crate::event::pb::InterfaceChange::Down, None);
         let vrf_id = self.ifindex_vrf_id(ifindex);
         for (_, sub) in self.client_registry.iter_link_subs(vrf_id) {
             let _ = sub.rib_rx_tx.send(RibRx::LinkDown(ifindex));
@@ -429,6 +476,7 @@ impl Rib {
     /// `ifindex_vrf_id` falls back to default VRF and the message
     /// goes to the wrong subscribers.
     pub fn api_link_del(&self, ifindex: u32) {
+        self.publish_ifindex_event(ifindex, crate::event::pb::InterfaceChange::Deleted, None);
         self.api_link_del_vrf(ifindex, self.ifindex_vrf_id(ifindex));
     }
 
@@ -443,6 +491,11 @@ impl Rib {
     }
 
     pub fn api_addr_add(&self, addr: &LinkAddr) {
+        self.publish_ifindex_event(
+            addr.ifindex,
+            crate::event::pb::InterfaceChange::AddressAdded,
+            Some(&addr.addr),
+        );
         self.api_addr_add_vrf(addr, self.ifindex_vrf_id(addr.ifindex));
     }
 
@@ -457,6 +510,11 @@ impl Rib {
     }
 
     pub fn api_addr_del(&self, addr: &LinkAddr) {
+        self.publish_ifindex_event(
+            addr.ifindex,
+            crate::event::pb::InterfaceChange::AddressDeleted,
+            Some(&addr.addr),
+        );
         self.api_addr_del_vrf(addr, self.ifindex_vrf_id(addr.ifindex));
     }
 
@@ -642,5 +700,72 @@ impl Rib {
                 .rib_rx_tx
                 .send(RibRx::FlexAlgoSrv6RouteDel { algo, prefix });
         }
+    }
+}
+
+#[cfg(test)]
+mod state_event_tests {
+    use super::*;
+    use crate::event::{self, EventKind, pb};
+    use crate::fib::message::FibLink;
+
+    /// The hub is process-wide and tests run in parallel, so collect
+    /// only this test's events by its (unique) interface name.
+    fn events_for(
+        rx: &mut tokio::sync::broadcast::Receiver<pb::StateEvent>,
+        name: &str,
+    ) -> Vec<pb::InterfaceEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(event::Event::Interface(i)) = ev.event
+                && i.name == name
+            {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fan_outs_publish_interface_changes() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::Interface]);
+        let mut rib = Rib::new(false).expect("rib");
+        let link = Link::from(FibLink {
+            index: 9001,
+            name: "evtest0".into(),
+            ..Default::default()
+        });
+        rib.api_link_add(&link);
+        rib.links.insert(link.index, link);
+        rib.api_link_up(9001);
+        let addr = LinkAddr {
+            addr: "192.0.2.1/24".parse().unwrap(),
+            ifindex: 9001,
+            ..Default::default()
+        };
+        rib.api_addr_add(&addr);
+        // A VRF-move replay is not a change to the interface.
+        rib.api_addr_add_vrf(&addr, 0);
+        rib.api_addr_del(&addr);
+        rib.api_link_down(9001);
+        rib.api_link_del(9001);
+
+        use pb::InterfaceChange::*;
+        let got: Vec<_> = events_for(&mut rx, "evtest0")
+            .into_iter()
+            .map(|i| (i.change, i.address))
+            .collect();
+        let want: Vec<_> = [
+            (Added, ""),
+            (Up, ""),
+            (AddressAdded, "192.0.2.1/24"),
+            (AddressDeleted, "192.0.2.1/24"),
+            (Down, ""),
+            (Deleted, ""),
+        ]
+        .into_iter()
+        .map(|(c, a)| (c as i32, a.to_string()))
+        .collect();
+        assert_eq!(got, want);
     }
 }

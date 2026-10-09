@@ -5,7 +5,9 @@ use tonic::Request;
 
 use pb::state_event::Event;
 use pb::state_service_client::StateServiceClient;
-use pb::{BfdState, BgpState, EventKind, OspfNeighborState, StateEvent, SubscribeRequest};
+use pb::{
+    BfdState, BgpState, EventKind, InterfaceChange, OspfNeighborState, StateEvent, SubscribeRequest,
+};
 
 pub mod pb {
     tonic::include_proto!("zebra.state.v1");
@@ -17,7 +19,8 @@ fn parse_kind(name: &str) -> Result<EventKind> {
         "bgp" | "bgp-peer" => Ok(EventKind::BgpPeer),
         "bfd" | "bfd-session" => Ok(EventKind::BfdSession),
         "ospf" | "ospf-neighbor" => Ok(EventKind::OspfNeighbor),
-        _ => bail!("unknown event family '{name}' (expected bgp, bfd or ospf)"),
+        "interface" | "if" => Ok(EventKind::Interface),
+        _ => bail!("unknown event family '{name}' (expected bgp, bfd, ospf or interface)"),
     }
 }
 
@@ -42,6 +45,12 @@ fn bfd_state(v: i32) -> String {
 fn ospf_state(v: i32) -> String {
     OspfNeighborState::try_from(v)
         .map(|s| state_name(s.as_str_name(), "OSPF_NEIGHBOR_STATE_"))
+        .unwrap_or_else(|_| v.to_string())
+}
+
+fn interface_change(v: i32) -> String {
+    InterfaceChange::try_from(v)
+        .map(|c| state_name(c.as_str_name(), "INTERFACE_CHANGE_"))
         .unwrap_or_else(|_| v.to_string())
 }
 
@@ -98,6 +107,19 @@ fn format_event(ev: &StateEvent) -> String {
             ospf_state(o.new_state),
             reason_suffix(&o.reason),
         ),
+        Some(Event::Interface(i)) => {
+            let address = if i.address.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", i.address)
+            };
+            format!(
+                "interface {} (ifindex {}) {}{address}",
+                i.name,
+                i.ifindex,
+                interface_change(i.change),
+            )
+        }
         None => "unknown event".to_string(),
     };
     format!("{secs}.{millis:03} #{}{vrf} {body}", ev.seq)
@@ -168,6 +190,13 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "new-state": ospf_state(o.new_state),
             "reason": o.reason,
         }),
+        Some(Event::Interface(i)) => json!({
+            "type": "interface",
+            "name": i.name,
+            "ifindex": i.ifindex,
+            "change": interface_change(i.change),
+            "address": i.address,
+        }),
         None => json!({ "type": "unknown" }),
     };
     json!({
@@ -212,6 +241,7 @@ mod tests {
         assert_eq!(parse_kind("bgp").unwrap(), EventKind::BgpPeer);
         assert_eq!(parse_kind("bfd-session").unwrap(), EventKind::BfdSession);
         assert_eq!(parse_kind("ospf").unwrap(), EventKind::OspfNeighbor);
+        assert_eq!(parse_kind("interface").unwrap(), EventKind::Interface);
         assert!(parse_kind("isis").is_err());
     }
 }

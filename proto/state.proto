@@ -26,6 +26,9 @@ enum EventKind {
   BFD_SESSION = 2;
   // OSPFv2 / OSPFv3 neighbor state transitions.
   OSPF_NEIGHBOR = 3;
+  // Interfaces appearing, disappearing, going up or down, and
+  // gaining or losing addresses.
+  INTERFACE = 4;
 }
 
 message SubscribeRequest {
@@ -60,6 +63,7 @@ message StateEvent {
     BgpPeerEvent bgp_peer = 10;
     BfdSessionEvent bfd_session = 11;
     OspfNeighborEvent ospf_neighbor = 12;
+    InterfaceEvent interface = 13;
   }
 }
 
@@ -135,6 +139,31 @@ message OspfNeighborEvent {
   // ("InactivityTimer", "SeqNumberMismatch", "KillNbr", …),
   // "InterfaceDown", or "RouterIdChange". Empty on forward progress.
   string reason = 7;
+}
+
+enum InterfaceChange {
+  INTERFACE_CHANGE_UNSPECIFIED = 0;
+  // The kernel reported a new interface.
+  INTERFACE_CHANGE_ADDED = 1;
+  // The interface was deleted.
+  INTERFACE_CHANGE_DELETED = 2;
+  // Operationally up: administratively up with carrier.
+  INTERFACE_CHANGE_UP = 3;
+  // Lost administrative state or carrier.
+  INTERFACE_CHANGE_DOWN = 4;
+  // An address was added to the interface; see `address`.
+  INTERFACE_CHANGE_ADDRESS_ADDED = 5;
+  // An address was removed from the interface; see `address`.
+  INTERFACE_CHANGE_ADDRESS_DELETED = 6;
+}
+
+message InterfaceEvent {
+  string name = 1;
+  uint32 ifindex = 2;
+  InterfaceChange change = 3;
+  // The address with its prefix length ("10.0.0.1/24"), set on
+  // ADDRESS_ADDED / ADDRESS_DELETED only.
+  string address = 4;
 }
 
 // Operational state-change subscription service.

@@ -45,10 +45,11 @@ pub use pb::state_event::Event;
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// Every selectable family, the expansion of an empty `kinds` list.
-const ALL_KINDS: [EventKind; 3] = [
+const ALL_KINDS: [EventKind; 4] = [
     EventKind::BgpPeer,
     EventKind::BfdSession,
     EventKind::OspfNeighbor,
+    EventKind::Interface,
 ];
 
 /// One slot per `EventKind` discriminant (slot 0, UNSPECIFIED, unused).
@@ -180,6 +181,7 @@ pub fn kind_of(event: &Event) -> EventKind {
         Event::BgpPeer(_) => EventKind::BgpPeer,
         Event::BfdSession(_) => EventKind::BfdSession,
         Event::OspfNeighbor(_) => EventKind::OspfNeighbor,
+        Event::Interface(_) => EventKind::Interface,
     }
 }
 
