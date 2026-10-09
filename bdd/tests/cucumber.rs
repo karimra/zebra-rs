@@ -1177,6 +1177,101 @@ async fn poll_bgp_session_state(
     (false, last)
 }
 
+/// Where `vtyctl events --json` in `<scoped>` writes, one event per line.
+fn state_events_file(scoped: &str) -> String {
+    format!("logs/{}.events.log", scoped)
+}
+
+/// This run's events from `<scoped>`, parsed; unparseable lines skipped.
+fn read_state_events(scoped: &str) -> Vec<Value> {
+    fs::read_to_string(state_events_file(scoped))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Whether `event` (one `vtyctl events --json` object) matches every
+/// `key=value` pair in `spec`. Keys are looked up in the inner `event`
+/// object first, then in the envelope (`seq`, `vrf`, …).
+fn state_event_matches(event: &Value, spec: &str) -> bool {
+    spec.split_whitespace().all(|pair| {
+        let Some((key, want)) = pair.split_once('=') else {
+            return false;
+        };
+        let got = event
+            .get("event")
+            .and_then(|e| e.get(key))
+            .or_else(|| event.get(key));
+        match got {
+            Some(Value::String(s)) => s == want,
+            // Numbers and booleans: compare as JSON values ("2", "true").
+            Some(other) => serde_json::from_str::<Value>(want).is_ok_and(|w| &w == other),
+            None => false,
+        }
+    })
+}
+
+#[when(expr = "I start streaming state events in namespace {string}")]
+async fn start_state_events(world: &mut World, namespace: String) {
+    let scoped = world.ns(&namespace);
+    let file = state_events_file(&scoped);
+    // A fresh file per run: the stream is deltas-only, so a line from an
+    // earlier run must never satisfy this run's assertions.
+    let _ = fs::remove_file(&file);
+    // `vtyctl events` ends by itself when the daemon goes away and closes
+    // the stream, so teardown needs no extra cleanup for it.
+    let _child = netns::spawn_in_netns(
+        &scoped,
+        "sh",
+        &["-c", &format!("exec vtyctl events --json > {file} 2>&1")],
+    )
+    .await
+    .expect("Failed to start vtyctl events");
+    // Let the subscription register before the steps that cause events.
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    println!("✓ Streaming state events from {} into {}", scoped, file);
+}
+
+#[then(expr = "state events in {string} should eventually include {string}")]
+async fn verify_state_event(world: &mut World, namespace: String, spec: String) {
+    let scoped = world.ns(&namespace);
+    // OSPF reaches Full only after its 40 s wait timer on a broadcast
+    // link, so allow well beyond that.
+    const ATTEMPTS: u32 = 90;
+    for _ in 0..ATTEMPTS {
+        if read_state_events(&scoped)
+            .iter()
+            .any(|e| state_event_matches(e, &spec))
+        {
+            println!("✓ {} streamed an event matching {}", scoped, spec);
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+    let raw = fs::read_to_string(state_events_file(&scoped)).unwrap_or_default();
+    panic!("no event in {scoped} matched `{spec}`; stream so far:\n{raw}");
+}
+
+#[then(expr = "state event sequence numbers in {string} should be strictly increasing")]
+async fn verify_state_event_seq(world: &mut World, namespace: String) {
+    let scoped = world.ns(&namespace);
+    let seqs: Vec<u64> = read_state_events(&scoped)
+        .iter()
+        .filter_map(|e| e.get("seq").and_then(Value::as_u64))
+        .collect();
+    assert!(!seqs.is_empty(), "no events streamed in {scoped}");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "sequence numbers in {scoped} not strictly increasing: {seqs:?}"
+    );
+    println!(
+        "✓ {} sequence numbers increase over {} events",
+        scoped,
+        seqs.len()
+    );
+}
+
 #[then(expr = "BGP session in {string} to {string} should eventually be {string}")]
 async fn verify_bgp_session_eventually(
     world: &mut World,
