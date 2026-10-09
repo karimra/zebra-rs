@@ -292,6 +292,7 @@ pub fn update_timers(peer: &mut Peer) {
                 // Active. This is the only place we manipulate the peer status outside the
                 // FSM.
                 peer.state = Active;
+                super::peer::publish_state_event(peer, Idle);
                 peer.timer.idle_hold_timer = None;
             } else {
                 if peer.timer.idle_hold_timer.is_none() {

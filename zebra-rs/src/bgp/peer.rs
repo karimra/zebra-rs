@@ -2201,6 +2201,50 @@ fn fsm_effect(
     }
 }
 
+/// Publish a `zebra.state.v1` FSM transition from `prev_state` to
+/// the peer's current state. Every site that moves `peer.state`
+/// outside [`fsm_next_state`] must call this, or subscribers miss the
+/// transition. No-op when the state did not change or nobody watches.
+pub fn publish_state_event(peer: &Peer, prev_state: State) {
+    use crate::event::{self, EventKind, pb};
+
+    if prev_state == peer.state || !event::wants(EventKind::BgpPeer) {
+        return;
+    }
+    fn state(s: State) -> pb::BgpState {
+        match s {
+            State::Idle => pb::BgpState::Idle,
+            State::Connect => pb::BgpState::Connect,
+            State::Active => pb::BgpState::Active,
+            State::OpenSent => pb::BgpState::OpenSent,
+            State::OpenConfirm => pb::BgpState::OpenConfirm,
+            State::Established => pb::BgpState::Established,
+        }
+    }
+    // `fsm` records the cause in `last_reset` before publishing.
+    let down_reason = if prev_state.is_established() {
+        peer.last_reset
+            .as_ref()
+            .map(|(reason, _)| reason.as_str().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    event::publish(
+        peer.ctx.vrf_id(),
+        peer.ctx.vrf_ifname().unwrap_or_default().to_string(),
+        event::Event::BgpPeer(pb::BgpPeerEvent {
+            peer_address: peer.address.to_string(),
+            interface: peer.ifname.clone().unwrap_or_default(),
+            local_as: peer.local_as,
+            remote_as: peer.remote_as,
+            old_state: state(prev_state) as i32,
+            new_state: state(peer.state) as i32,
+            down_reason,
+        }),
+    );
+}
+
 pub fn fsm(
     bgp_ref: &mut BgpTop,
     peer_map: &mut PeerMap,
@@ -2285,6 +2329,7 @@ pub fn fsm(
             }
             route_sync(peer, bgp_ref, shards.is_some());
         }
+        publish_state_event(peer, prev_state);
         timer::update_timers(peer);
     }
 
@@ -3916,11 +3961,15 @@ pub(super) fn handle_peer_connection(
                 // other had kept, and both redialled after the idle hold.
                 // If it completes, it is parked as the §6.8 collision
                 // conn (`Event::Connected` in OpenSent).
+                let prev_state = peer.state;
                 peer.state = fsm_connected(peer, Role::Passive, stream);
+                publish_state_event(peer, prev_state);
                 None
             }
             State::Active => {
+                let prev_state = peer.state;
                 peer.state = fsm_connected(peer, Role::Passive, stream);
+                publish_state_event(peer, prev_state);
                 None
             }
             State::OpenSent | State::OpenConfirm => {
@@ -4379,6 +4428,82 @@ mod bfd_config_tests {
         assert!(!eff.enable);
         assert_eq!(eff.echo_mode, Some(EchoMode::Both));
         assert_eq!(eff.echo_transmit_ms, 100); // inherits
+    }
+}
+
+#[cfg(test)]
+mod state_event_tests {
+    use super::*;
+    use crate::event::{self, EventKind, pb};
+
+    fn test_peer(addr: &str, passive: bool) -> Peer {
+        let (tx, rx) = mpsc::channel::<Message>(64);
+        Box::leak(Box::new(rx));
+        let mut peer = Peer::new(
+            1,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            65002,
+            addr.parse().unwrap(),
+            None,
+            tx,
+            crate::context::ProtoContext::default_table_no_rib(),
+        );
+        peer.config.transport.passive = passive;
+        peer.first_start = false;
+        peer
+    }
+
+    /// The hub is process-wide and tests run in parallel, so pick this
+    /// test's event out by its (unique) peer address.
+    fn next_for(
+        rx: &mut tokio::sync::broadcast::Receiver<pb::StateEvent>,
+        addr: &str,
+    ) -> Option<pb::BgpPeerEvent> {
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(event::Event::BgpPeer(p)) = ev.event
+                && p.peer_address == addr
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn passive_idle_to_active_is_published() {
+        let addr = "10.250.0.1";
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BgpPeer]);
+        let mut peer = test_peer(addr, true);
+        timer::update_timers(&mut peer);
+        let ev = next_for(&mut rx, addr).expect("Idle -> Active event");
+        assert_eq!(ev.old_state, pb::BgpState::Idle as i32);
+        assert_eq!(ev.new_state, pb::BgpState::Active as i32);
+        assert_eq!((ev.local_as, ev.remote_as), (65001, 65002));
+        assert!(ev.down_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaving_established_carries_the_down_reason() {
+        let addr = "10.250.0.2";
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BgpPeer]);
+        let mut peer = test_peer(addr, false);
+        peer.state = State::Idle;
+        peer.last_reset = Some((PeerDownReason::HoldTimerExpired, Instant::now()));
+        publish_state_event(&peer, State::Established);
+        let ev = next_for(&mut rx, addr).expect("Established -> Idle event");
+        assert_eq!(ev.old_state, pb::BgpState::Established as i32);
+        assert_eq!(ev.new_state, pb::BgpState::Idle as i32);
+        assert_eq!(ev.down_reason, PeerDownReason::HoldTimerExpired.as_str());
+    }
+
+    #[tokio::test]
+    async fn unchanged_state_is_not_published() {
+        let addr = "10.250.0.3";
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BgpPeer]);
+        let peer = test_peer(addr, false);
+        publish_state_event(&peer, peer.state);
+        assert!(next_for(&mut rx, addr).is_none());
     }
 }
 

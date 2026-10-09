@@ -1,0 +1,116 @@
+// Copyright 2026 Zebra Project.
+
+syntax = "proto3";
+
+// Operational state-change stream.
+//
+// `config.proto` streams changes to the running configuration; this
+// streams changes to the daemon's operational state — protocol
+// sessions coming up and going down — as typed events, so automation
+// (telemetry collectors, a gNMI server, SONiC's STATE_DB writers) can
+// react to them without polling `show … json`.
+//
+// Like zebra.config.v1 and zebra.show.v1 this is a machine-to-machine
+// API, versioned independently of the interactive `vty` package and
+// served on the same gRPC endpoint.
+package zebra.state.v1;
+
+// Event families a subscriber can select. The daemon only builds the
+// events of a family while at least one subscriber selects it, so an
+// unwatched family costs one atomic load per state change.
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  // BGP neighbor FSM transitions.
+  BGP_PEER = 1;
+  // BFD session state transitions.
+  BFD_SESSION = 2;
+}
+
+message SubscribeRequest {
+  // Families to receive. Empty = every family.
+  repeated EventKind kinds = 1;
+}
+
+// One state change.
+//
+// The stream carries changes only: it starts with the first change
+// after the subscription is registered, with no snapshot of the
+// current state. Read the current state with `show … json` after
+// subscribing; a change racing that read is then delivered rather
+// than lost.
+//
+// A subscriber that stops reading long enough to overrun the
+// daemon-side buffer is disconnected with RESOURCE_EXHAUSTED; it
+// should resubscribe and re-read the current state.
+message StateEvent {
+  // Daemon-wide sequence number, strictly increasing in delivery
+  // order across all families. A gap means events were dropped.
+  uint64 seq = 1;
+  // Wall-clock time of the change, in nanoseconds since the Unix
+  // epoch.
+  uint64 timestamp_ns = 2;
+  // VRF the change happened in: kernel VRF id (0 = default VRF) and
+  // name (empty for the default VRF).
+  uint32 vrf_id = 3;
+  string vrf = 4;
+
+  oneof event {
+    BgpPeerEvent bgp_peer = 10;
+    BfdSessionEvent bfd_session = 11;
+  }
+}
+
+// RFC 4271 §8 FSM states.
+enum BgpState {
+  BGP_STATE_UNSPECIFIED = 0;
+  BGP_STATE_IDLE = 1;
+  BGP_STATE_CONNECT = 2;
+  BGP_STATE_ACTIVE = 3;
+  BGP_STATE_OPEN_SENT = 4;
+  BGP_STATE_OPEN_CONFIRM = 5;
+  BGP_STATE_ESTABLISHED = 6;
+}
+
+message BgpPeerEvent {
+  // Neighbor transport address.
+  string peer_address = 1;
+  // Interface of an interface-keyed (unnumbered) neighbor; empty
+  // otherwise.
+  string interface = 2;
+  uint32 local_as = 3;
+  uint32 remote_as = 4;
+  BgpState old_state = 5;
+  BgpState new_state = 6;
+  // Why an Established session ended ("Hold timer expired", "BFD
+  // down", …). Set only on a transition out of Established.
+  string down_reason = 7;
+}
+
+// RFC 5880 §4.1 session states.
+enum BfdState {
+  BFD_STATE_UNSPECIFIED = 0;
+  BFD_STATE_ADMIN_DOWN = 1;
+  BFD_STATE_DOWN = 2;
+  BFD_STATE_INIT = 3;
+  BFD_STATE_UP = 4;
+}
+
+message BfdSessionEvent {
+  string local_address = 1;
+  string remote_address = 2;
+  // Interface index of a single-hop session; 0 for multihop.
+  uint32 ifindex = 3;
+  bool multihop = 4;
+  BfdState old_state = 5;
+  BfdState new_state = 6;
+  // Local diagnostic accompanying the change (RFC 5880 §4.1).
+  string diagnostic = 7;
+}
+
+// Operational state-change subscription service.
+//
+// Subscribe opens a deltas-only stream of the selected families (see
+// `StateEvent` for the delivery contract).
+service StateService {
+  rpc Subscribe(SubscribeRequest) returns (stream StateEvent) {}
+}

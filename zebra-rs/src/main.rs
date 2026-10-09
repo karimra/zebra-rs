@@ -16,6 +16,7 @@ mod bfd;
 mod bgp;
 mod config;
 mod context;
+mod event;
 use config::{Cli, ConfigManager};
 #[cfg(target_os = "linux")]
 mod cradle;

@@ -31,6 +31,7 @@ use super::vty::{
     EnableReply, EnableRequest, ExecCode, ExecReply, ExecRequest, ExecType, LogoutReply,
     LogoutRequest, ShowReply, ShowRequest, YangMatch,
 };
+use crate::event::{StateServiceServer, StateSubscribeService};
 
 #[derive(Debug)]
 struct ExecService {
@@ -805,10 +806,10 @@ pub fn serve(cli: Cli, addr: VtyAddr) -> anyhow::Result<()> {
         sessions: sessions.clone(),
     };
     // Machine-facing APIs: running-config subscription
-    // (zebra.config.v1) and the external show provider
-    // (zebra.show.v1). Both use the session-less machine interceptor:
-    // they carry no role-gated operations, so there is no session to
-    // resolve.
+    // (zebra.config.v1), the external show provider (zebra.show.v1)
+    // and the operational state-change stream (zebra.state.v1). All
+    // use the session-less machine interceptor: they carry no
+    // role-gated operations, so there is no session to resolve.
     let config_service = ConfigSubscribeService { tx: cli.tx.clone() };
     let show_provider = ShowProviderBridge { tx: cli.tx.clone() };
     let machine_interceptor = MachinePeerInterceptor::from_env();
@@ -855,6 +856,10 @@ pub fn serve(cli: Cli, addr: VtyAddr) -> anyhow::Result<()> {
         ))
         .add_service(ShowProviderServiceServer::with_interceptor(
             show_provider,
+            machine_interceptor.clone(),
+        ))
+        .add_service(StateServiceServer::with_interceptor(
+            StateSubscribeService,
             machine_interceptor,
         ))
         .add_service(ClearServer::with_interceptor(clear_service, interceptor));

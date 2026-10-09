@@ -9,6 +9,7 @@ use crate::config::{
     Args, ConfigChannel, ConfigOp, ConfigRequest, DisplayRequest, ShowChannel, path_from_command,
 };
 use crate::context::{ProtoContext, Task};
+use crate::event::{self, EventKind, pb as event_pb};
 
 use super::fsm::Event;
 use super::network::{WriteRequest, read_packet, read_packet_v6, write_packet, write_packet_v6};
@@ -1111,7 +1112,32 @@ impl Bfd {
                 let _ = tx.send(BfdEvent::StateChange { key, change });
             }
         }
+        if event::wants(EventKind::BfdSession) {
+            event::publish(0, String::new(), state_event(key, change));
+        }
     }
+}
+
+/// The `zebra.state.v1` form of a session transition.
+fn state_event(key: SessionKey, change: StateChange) -> event::Event {
+    fn state(s: bfd_packet::State) -> event_pb::BfdState {
+        use bfd_packet::State::*;
+        match s {
+            AdminDown => event_pb::BfdState::AdminDown,
+            Down => event_pb::BfdState::Down,
+            Init => event_pb::BfdState::Init,
+            Up => event_pb::BfdState::Up,
+        }
+    }
+    event::Event::BfdSession(event_pb::BfdSessionEvent {
+        local_address: key.local.to_string(),
+        remote_address: key.remote.to_string(),
+        ifindex: key.ifindex,
+        multihop: key.multihop,
+        old_state: state(change.from) as i32,
+        new_state: state(change.to) as i32,
+        diagnostic: change.diag.to_string(),
+    })
 }
 
 /// Spawn the event loop. Mirrors [`crate::ospf::serve`]. The returned
@@ -1127,6 +1153,30 @@ pub fn serve(mut bfd: Bfd) -> Task<()> {
 mod tests {
     use super::super::session::EchoMode;
     use super::*;
+
+    #[test]
+    fn state_event_maps_the_transition() {
+        let key = SessionKey {
+            local: "10.0.0.1".parse().unwrap(),
+            remote: "10.0.0.2".parse().unwrap(),
+            ifindex: 3,
+            multihop: false,
+        };
+        let change = StateChange {
+            from: bfd_packet::State::Up,
+            to: bfd_packet::State::Down,
+            diag: bfd_packet::Diag::ControlDetectionTimeExpired,
+        };
+        let event::Event::BfdSession(ev) = state_event(key, change) else {
+            panic!("expected a BFD session event");
+        };
+        assert_eq!(ev.local_address, "10.0.0.1");
+        assert_eq!(ev.remote_address, "10.0.0.2");
+        assert_eq!((ev.ifindex, ev.multihop), (3, false));
+        assert_eq!(ev.old_state, event_pb::BfdState::Up as i32);
+        assert_eq!(ev.new_state, event_pb::BfdState::Down as i32);
+        assert_eq!(ev.diagnostic, "ControlDetectionTimeExpired");
+    }
 
     fn fresh_bfd() -> Bfd {
         Bfd::new_with(

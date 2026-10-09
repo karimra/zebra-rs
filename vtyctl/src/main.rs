@@ -7,6 +7,7 @@ pub mod vty {
 pub mod apply;
 pub mod clear;
 pub mod endpoint;
+pub mod events;
 pub mod mcp;
 pub mod show;
 pub mod watch;
@@ -83,6 +84,17 @@ enum Commands {
         #[arg(help = "Config path to watch, e.g. 'router bgp' (omit for the whole config)")]
         path: Vec<String>,
     },
+    #[command(disable_help_flag = true)]
+    Events {
+        #[arg(short, long, help = "Server endpoint URI (overrides --vty-socket)")]
+        host: Option<String>,
+
+        #[arg(short, long, help = "One JSON object per event")]
+        json: bool,
+
+        #[arg(help = "Event families to stream: bgp, bfd (omit for all)")]
+        families: Vec<String>,
+    },
     /// Start MCP (Model Context Protocol) server for AI assistant integration
     Mcp {
         #[arg(
@@ -128,6 +140,7 @@ fn print_help() {
     eprintln!("  clear       Clear commands.");
     eprintln!("  show        Show commands.");
     eprintln!("  watch       Watch running-config commits.");
+    eprintln!("  events      Stream operational state changes.");
     eprintln!("  mcp         Start MCP server for AI assistant integration.");
 }
 
@@ -155,6 +168,13 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Watch { host, json, path }) => {
             watch::watch(endpoint(host, &cli.vty_socket), *json, path.clone()).await?;
+        }
+        Some(Commands::Events {
+            host,
+            json,
+            families,
+        }) => {
+            events::events(endpoint(host, &cli.vty_socket), *json, families).await?;
         }
         Some(Commands::Mcp {
             host,

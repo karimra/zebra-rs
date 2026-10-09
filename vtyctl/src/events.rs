@@ -1,0 +1,184 @@
+use anyhow::{Result, bail};
+use std::io::Write;
+use std::process::exit;
+use tonic::Request;
+
+use pb::state_event::Event;
+use pb::state_service_client::StateServiceClient;
+use pb::{BfdState, BgpState, EventKind, StateEvent, SubscribeRequest};
+
+pub mod pb {
+    tonic::include_proto!("zebra.state.v1");
+}
+
+/// Map a command-line family name to its `EventKind`.
+fn parse_kind(name: &str) -> Result<EventKind> {
+    match name {
+        "bgp" | "bgp-peer" => Ok(EventKind::BgpPeer),
+        "bfd" | "bfd-session" => Ok(EventKind::BfdSession),
+        _ => bail!("unknown event family '{name}' (expected bgp or bfd)"),
+    }
+}
+
+/// Display form of a state: its proto name without the type prefix
+/// (`BGP_STATE_OPEN_SENT` -> `OPEN_SENT`).
+fn state_name(full: &str, prefix: &str) -> String {
+    full.strip_prefix(prefix).unwrap_or(full).to_string()
+}
+
+fn bgp_state(v: i32) -> String {
+    BgpState::try_from(v)
+        .map(|s| state_name(s.as_str_name(), "BGP_STATE_"))
+        .unwrap_or_else(|_| v.to_string())
+}
+
+fn bfd_state(v: i32) -> String {
+    BfdState::try_from(v)
+        .map(|s| state_name(s.as_str_name(), "BFD_STATE_"))
+        .unwrap_or_else(|_| v.to_string())
+}
+
+/// One event as a single human-readable line.
+fn format_event(ev: &StateEvent) -> String {
+    let secs = ev.timestamp_ns / 1_000_000_000;
+    let millis = (ev.timestamp_ns % 1_000_000_000) / 1_000_000;
+    let vrf = if ev.vrf.is_empty() {
+        String::new()
+    } else {
+        format!(" vrf {}", ev.vrf)
+    };
+    let body = match &ev.event {
+        Some(Event::BgpPeer(p)) => {
+            let ifname = if p.interface.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", p.interface)
+            };
+            let reason = if p.down_reason.is_empty() {
+                String::new()
+            } else {
+                format!(" reason: {}", p.down_reason)
+            };
+            format!(
+                "bgp neighbor {}{ifname} AS{} {} -> {}{reason}",
+                p.peer_address,
+                p.remote_as,
+                bgp_state(p.old_state),
+                bgp_state(p.new_state),
+            )
+        }
+        Some(Event::BfdSession(b)) => format!(
+            "bfd {} -> {}{} {} -> {} diag: {}",
+            b.local_address,
+            b.remote_address,
+            if b.multihop { " multihop" } else { "" },
+            bfd_state(b.old_state),
+            bfd_state(b.new_state),
+            b.diagnostic,
+        ),
+        None => "unknown event".to_string(),
+    };
+    format!("{secs}.{millis:03} #{}{vrf} {body}", ev.seq)
+}
+
+pub async fn events(host: &str, json: bool, families: &[String]) -> Result<()> {
+    let kinds = families
+        .iter()
+        .map(|f| parse_kind(f).map(|k| k as i32))
+        .collect::<Result<Vec<_>>>()?;
+
+    let uri = crate::endpoint::host_uri(host);
+    let channel = match crate::endpoint::connect(&uri).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Can't connect to {uri}: {e}");
+            exit(3);
+        }
+    };
+    let mut client = StateServiceClient::new(channel);
+    let mut stream = client
+        .subscribe(Request::new(SubscribeRequest { kinds }))
+        .await?
+        .into_inner();
+
+    while let Some(ev) = stream.message().await? {
+        if json {
+            println!("{}", serde_json::to_string(&event_json(&ev))?);
+        } else {
+            println!("{}", format_event(&ev));
+        }
+        std::io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+/// One event as a JSON object (prost types carry no serde derive).
+fn event_json(ev: &StateEvent) -> serde_json::Value {
+    use serde_json::json;
+    let event = match &ev.event {
+        Some(Event::BgpPeer(p)) => json!({
+            "type": "bgp-peer",
+            "peer-address": p.peer_address,
+            "interface": p.interface,
+            "local-as": p.local_as,
+            "remote-as": p.remote_as,
+            "old-state": bgp_state(p.old_state),
+            "new-state": bgp_state(p.new_state),
+            "down-reason": p.down_reason,
+        }),
+        Some(Event::BfdSession(b)) => json!({
+            "type": "bfd-session",
+            "local-address": b.local_address,
+            "remote-address": b.remote_address,
+            "ifindex": b.ifindex,
+            "multihop": b.multihop,
+            "old-state": bfd_state(b.old_state),
+            "new-state": bfd_state(b.new_state),
+            "diagnostic": b.diagnostic,
+        }),
+        None => json!({ "type": "unknown" }),
+    };
+    json!({
+        "seq": ev.seq,
+        "timestamp-ns": ev.timestamp_ns,
+        "vrf-id": ev.vrf_id,
+        "vrf": ev.vrf,
+        "event": event,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pb::BgpPeerEvent;
+
+    #[test]
+    fn bgp_event_renders_on_one_line() {
+        let ev = StateEvent {
+            seq: 7,
+            timestamp_ns: 1_700_000_000_123_000_000,
+            vrf_id: 10,
+            vrf: "blue".into(),
+            event: Some(Event::BgpPeer(BgpPeerEvent {
+                peer_address: "10.0.0.2".into(),
+                interface: String::new(),
+                local_as: 65001,
+                remote_as: 65002,
+                old_state: BgpState::Established as i32,
+                new_state: BgpState::Idle as i32,
+                down_reason: "Hold timer expired".into(),
+            })),
+        };
+        assert_eq!(
+            format_event(&ev),
+            "1700000000.123 #7 vrf blue bgp neighbor 10.0.0.2 AS65002 ESTABLISHED -> IDLE reason: Hold timer expired"
+        );
+    }
+
+    #[test]
+    fn family_names_parse() {
+        assert_eq!(parse_kind("bgp").unwrap(), EventKind::BgpPeer);
+        assert_eq!(parse_kind("bfd-session").unwrap(), EventKind::BfdSession);
+        assert!(parse_kind("ospf").is_err());
+    }
+}
