@@ -45,11 +45,12 @@ pub use pb::state_event::Event;
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// Every selectable family, the expansion of an empty `kinds` list.
-const ALL_KINDS: [EventKind; 4] = [
+const ALL_KINDS: [EventKind; 5] = [
     EventKind::BgpPeer,
     EventKind::BfdSession,
     EventKind::OspfNeighbor,
     EventKind::Interface,
+    EventKind::SpfRun,
 ];
 
 /// One slot per `EventKind` discriminant (slot 0, UNSPECIFIED, unused).
@@ -182,7 +183,34 @@ pub fn kind_of(event: &Event) -> EventKind {
         Event::BfdSession(_) => EventKind::BfdSession,
         Event::OspfNeighbor(_) => EventKind::OspfNeighbor,
         Event::Interface(_) => EventKind::Interface,
+        Event::SpfRun(_) => EventKind::SpfRun,
     }
+}
+
+/// Publish an applied SPF run. Shared by IS-IS and OSPF; `level` is
+/// 0 and `area` empty where they do not apply.
+pub fn publish_spf_run(
+    ctx: &crate::context::ProtoContext,
+    protocol: &str,
+    level: u32,
+    area: String,
+    duration: std::time::Duration,
+    nodes_reached: usize,
+) {
+    if !wants(EventKind::SpfRun) {
+        return;
+    }
+    publish(
+        ctx.vrf_id(),
+        ctx.vrf_ifname().unwrap_or_default().to_string(),
+        Event::SpfRun(pb::SpfRunEvent {
+            protocol: protocol.to_string(),
+            level,
+            area,
+            duration_us: duration.as_micros() as u64,
+            nodes_reached: nodes_reached as u32,
+        }),
+    );
 }
 
 #[cfg(test)]

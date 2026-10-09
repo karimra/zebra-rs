@@ -29,6 +29,8 @@ enum EventKind {
   // Interfaces appearing, disappearing, going up or down, and
   // gaining or losing addresses.
   INTERFACE = 4;
+  // IS-IS / OSPF shortest-path-first runs whose result was applied.
+  SPF_RUN = 5;
 }
 
 message SubscribeRequest {
@@ -64,6 +66,7 @@ message StateEvent {
     BfdSessionEvent bfd_session = 11;
     OspfNeighborEvent ospf_neighbor = 12;
     InterfaceEvent interface = 13;
+    SpfRunEvent spf_run = 14;
   }
 }
 
@@ -164,6 +167,21 @@ message InterfaceEvent {
   // The address with its prefix length ("10.0.0.1/24"), set on
   // ADDRESS_ADDED / ADDRESS_DELETED only.
   string address = 4;
+}
+
+// One SPF computation whose result was installed. Runs superseded
+// before they finished (a newer topology arrived) are not reported.
+message SpfRunEvent {
+  // "isis", "ospf" (v2) or "ospfv3".
+  string protocol = 1;
+  // IS-IS level (1 or 2); 0 for OSPF.
+  uint32 level = 2;
+  // OSPF area id; empty for IS-IS.
+  string area = 3;
+  // Wall time of the computation itself, excluding RIB updates.
+  uint64 duration_us = 4;
+  // Nodes reached from this router, itself included.
+  uint32 nodes_reached = 5;
 }
 
 // Operational state-change subscription service.

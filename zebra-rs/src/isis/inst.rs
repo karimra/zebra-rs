@@ -2145,6 +2145,16 @@ impl Isis {
                 let stale = self
                     .microloop
                     .output_is_stale(level, output.microloop_revision);
+                if !stale {
+                    crate::event::publish_spf_run(
+                        &self.ctx,
+                        "isis",
+                        level.digit() as u32,
+                        String::new(),
+                        output.duration(),
+                        output.nodes_reached(),
+                    );
+                }
                 let mut top = self.top();
                 if !stale {
                     apply_spf_result(&mut top, *output);

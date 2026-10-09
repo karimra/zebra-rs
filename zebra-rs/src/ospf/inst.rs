@@ -8033,6 +8033,14 @@ impl Ospf<Ospfv2> {
             Message::SpfDone(output) => {
                 let area_id = output.area_id;
                 if self.spf_current(area_id) {
+                    crate::event::publish_spf_run(
+                        &self.ctx,
+                        "ospf",
+                        0,
+                        area_id.to_string(),
+                        output.duration,
+                        output.spf_result.len(),
+                    );
                     apply_spf_result(self, *output);
                     if !self.in_restart() {
                         self.exit_area_done(area_id);
@@ -12410,6 +12418,14 @@ impl Ospf<Ospfv3> {
             Message::SpfDone(output) => {
                 let area_id = output.area_id;
                 if self.spf_current(area_id) {
+                    crate::event::publish_spf_run(
+                        &self.ctx,
+                        "ospfv3",
+                        0,
+                        area_id.to_string(),
+                        output.duration,
+                        output.spf_result.len(),
+                    );
                     apply_v3_spf_result(self, *output);
                     if !self.in_restart() {
                         self.exit_area_done(area_id);

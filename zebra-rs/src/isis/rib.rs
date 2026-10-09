@@ -1876,6 +1876,18 @@ fn register_mpls_protections(top: &IsisTop) {
         .send(crate::rib::Message::EgressMplsProtectSet { protections });
 }
 
+impl SpfOutput {
+    /// Wall time of the computation, for state events.
+    pub(super) fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Nodes the SPF reached, the source included.
+    pub(super) fn nodes_reached(&self) -> usize {
+        self.spf_result.len()
+    }
+}
+
 pub(super) fn apply_spf_result(top: &mut IsisTop, output: SpfOutput) {
     let SpfOutput {
         level,

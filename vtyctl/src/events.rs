@@ -20,7 +20,8 @@ fn parse_kind(name: &str) -> Result<EventKind> {
         "bfd" | "bfd-session" => Ok(EventKind::BfdSession),
         "ospf" | "ospf-neighbor" => Ok(EventKind::OspfNeighbor),
         "interface" | "if" => Ok(EventKind::Interface),
-        _ => bail!("unknown event family '{name}' (expected bgp, bfd, ospf or interface)"),
+        "spf" | "spf-run" => Ok(EventKind::SpfRun),
+        _ => bail!("unknown event family '{name}' (expected bgp, bfd, ospf, interface or spf)"),
     }
 }
 
@@ -120,6 +121,17 @@ fn format_event(ev: &StateEvent) -> String {
                 interface_change(i.change),
             )
         }
+        Some(Event::SpfRun(r)) => {
+            let scope = if r.protocol == "isis" {
+                format!("level-{}", r.level)
+            } else {
+                format!("area {}", r.area)
+            };
+            format!(
+                "{} spf {scope} {} nodes in {} us",
+                r.protocol, r.nodes_reached, r.duration_us
+            )
+        }
         None => "unknown event".to_string(),
     };
     format!("{secs}.{millis:03} #{}{vrf} {body}", ev.seq)
@@ -197,6 +209,14 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "change": interface_change(i.change),
             "address": i.address,
         }),
+        Some(Event::SpfRun(r)) => json!({
+            "type": "spf-run",
+            "protocol": r.protocol,
+            "level": r.level,
+            "area": r.area,
+            "duration-us": r.duration_us,
+            "nodes-reached": r.nodes_reached,
+        }),
         None => json!({ "type": "unknown" }),
     };
     json!({
@@ -242,6 +262,7 @@ mod tests {
         assert_eq!(parse_kind("bfd-session").unwrap(), EventKind::BfdSession);
         assert_eq!(parse_kind("ospf").unwrap(), EventKind::OspfNeighbor);
         assert_eq!(parse_kind("interface").unwrap(), EventKind::Interface);
+        assert_eq!(parse_kind("spf").unwrap(), EventKind::SpfRun);
         assert!(parse_kind("isis").is_err());
     }
 }
