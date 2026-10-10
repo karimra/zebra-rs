@@ -11,7 +11,8 @@ any protocol is configured, so the stream must carry the whole
 session bring-up, and then the teardown when z1's link goes down.
 A second subscriber joins once everything is up and asks for a
 snapshot, so it must be told the current state without any change
-happening.
+happening. Finally a neighbor and then a whole protocol instance
+are deleted, and their objects must be streamed as removed.
 
 ## Test Topology
 
@@ -40,4 +41,5 @@ happening.
 | Session bring-up is streamed | |
 | A late subscriber gets the current state as a snapshot | |
 | Link down is streamed with its consequences | |
+| Deleted neighbors and instances are streamed as removals | |
 | Teardown topology | |

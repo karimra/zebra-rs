@@ -5577,7 +5577,7 @@ impl Rib {
         let mut snapshot = crate::event::snapshot_source();
         loop {
             tokio::select! {
-                Some(req) = snapshot.recv() => self.publish_snapshot(&req),
+                Some(req) = snapshot.recv() => self.publish_state(&req),
                 Some(msg) = self.rx.recv() => {
                     // Legacy / internal channel. Every `rib_tx`
                     // sender drives the default routing table — the

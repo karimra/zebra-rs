@@ -1282,14 +1282,13 @@ impl Isis {
 
             for sys_id in nbr_ids {
                 if let Some(nbr) = link.state.nbrs.get_mut(&level).get_mut(&sys_id) {
-                    super::nfsm::publish_adj_event(
+                    super::nfsm::publish_adj_removed(
                         &self.ctx,
                         &link.state.name,
                         &self.hostname,
                         level,
                         nbr,
                         nbr.state,
-                        super::nfsm::NfsmState::Down,
                         "InterfaceDown",
                     );
                     // Release SR-MPLS adjacency labels.

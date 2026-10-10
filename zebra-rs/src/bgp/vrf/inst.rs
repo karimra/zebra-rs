@@ -2047,7 +2047,7 @@ impl BgpVrf {
                     self.process_msg(msg);
                 }
                 Some(req) = snapshot.recv() => {
-                    crate::bgp::peer::publish_snapshot(&self.peers, &req);
+                    crate::bgp::peer::publish_state(&self.peers, &req);
                 }
                 msg = self.global_rx.recv() => {
                     match msg {
@@ -4064,9 +4064,16 @@ fn spawn_accept_loop(
     })
 }
 
-pub fn serve_vrf(mut vrf: BgpVrf) -> Task<()> {
+impl crate::event::PublishState for BgpVrf {
+    fn publish_state(&self, sink: &dyn crate::event::Sink) {
+        crate::bgp::peer::publish_state(&self.peers, sink);
+    }
+}
+
+pub fn serve_vrf(vrf: BgpVrf) -> Task<()> {
     Task::spawn(async move {
-        vrf.event_loop().await;
+        let mut vrf = crate::event::Retiring(vrf);
+        vrf.0.event_loop().await;
     })
 }
 

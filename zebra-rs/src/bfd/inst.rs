@@ -573,6 +573,15 @@ impl Bfd {
             let _ = h.cmd_tx.send(TimerCmd::Shutdown);
         }
         let removed = self.sessions.remove(key);
+        if let Some(s) = &removed
+            && event::wants(EventKind::BfdSession)
+        {
+            event::publish_removed(
+                0,
+                String::new(),
+                state_event(*key, None, s.local_state, s.local_diag),
+            );
+        }
         // Mirror the `add_session` acquire predicate exactly. The fields can
         // mutate at runtime (`update_offload_params`), but that path adjusts
         // the reflector refcount on every off↔on edge, so releasing on the
@@ -635,7 +644,7 @@ impl Bfd {
         let mut snapshot = event::snapshot_source();
         loop {
             tokio::select! {
-                Some(req) = snapshot.recv() => self.publish_snapshot(&req),
+                Some(req) = snapshot.recv() => self.publish_sessions(&req),
                 Some(msg) = self.rx.recv() => match msg {
                     Message::Recv { packet, src, dst, ifindex, ttl, multihop } =>
                         self.on_recv(packet, src, dst, ifindex, ttl, multihop),
@@ -1125,12 +1134,13 @@ impl Bfd {
     }
 
     /// Answer a `zebra.state.v1` snapshot request with every session.
-    fn publish_snapshot(&self, req: &event::SnapshotRequest) {
-        if !req.wants(EventKind::BfdSession) {
+    /// Walk every session's current state into `sink`.
+    fn publish_sessions(&self, sink: &dyn event::Sink) {
+        if !sink.wants(EventKind::BfdSession) {
             return;
         }
         for (key, s) in self.sessions.iter() {
-            req.publish(
+            sink.publish(
                 0,
                 String::new(),
                 state_event(*key, None, s.local_state, s.local_diag),
@@ -1170,9 +1180,16 @@ fn state_event(
 /// Spawn the event loop. Mirrors [`crate::ospf::serve`]. The returned
 /// [`Task`] handle owns the spawned future; dropping it aborts the
 /// loop (see [`crate::config::bfd::despawn_bfd`]).
-pub fn serve(mut bfd: Bfd) -> Task<()> {
+impl event::PublishState for Bfd {
+    fn publish_state(&self, sink: &dyn event::Sink) {
+        self.publish_sessions(sink);
+    }
+}
+
+pub fn serve(bfd: Bfd) -> Task<()> {
     Task::spawn(async move {
-        bfd.event_loop().await;
+        let mut bfd = event::Retiring(bfd);
+        bfd.0.event_loop().await;
     })
 }
 
@@ -1222,6 +1239,44 @@ mod tests {
             ifindex: 0,
             multihop: false,
         }
+    }
+
+    fn removal_for(
+        rx: &mut tokio::sync::broadcast::Receiver<event_pb::StateEvent>,
+        remote: &str,
+    ) -> Option<event_pb::StateEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).find(|ev| {
+            matches!(&ev.event, Some(event::Event::BfdSession(b)) if b.remote_address == remote)
+                && ev.removed
+        })
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_publishes_its_removal() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BfdSession]);
+        let mut bfd = fresh_bfd();
+        let key = loopback_key(41);
+        let (tx, _events) = mpsc::unbounded_channel();
+        bfd.subscribe("test".into(), key, SessionParams::default(), tx);
+        bfd.remove_session(&key);
+        assert!(removal_for(&mut rx, "127.0.0.41").is_some());
+    }
+
+    /// The teardown guard reports what the instance still held when
+    /// its task ends (here: is dropped, as an abort would).
+    #[tokio::test]
+    async fn retiring_the_instance_removes_its_sessions() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BfdSession]);
+        let mut bfd = fresh_bfd();
+        let (tx, _events) = mpsc::unbounded_channel();
+        bfd.subscribe(
+            "test".into(),
+            loopback_key(42),
+            SessionParams::default(),
+            tx,
+        );
+        drop(event::Retiring(bfd));
+        assert!(removal_for(&mut rx, "127.0.0.42").is_some());
     }
 
     /// Single-client subscribe creates the underlying session and

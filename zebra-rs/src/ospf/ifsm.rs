@@ -187,16 +187,12 @@ pub fn ospf_ifsm_interface_up<V: OspfVersion>(link: &mut OspfLink<V>) -> Option<
 }
 
 pub fn ospf_ifsm_interface_down<V: OspfVersion>(oi: &mut OspfLink<V>) -> Option<IfsmState> {
-    // Kill all neighbors.
+    // Kill all neighbors. A disabled link's neighbors were already
+    // reported removed by `Disable`, while it still knew their area.
+    if oi.enabled {
+        super::nfsm::publish_link_nbrs_removed(oi, &"InterfaceDown");
+    }
     for nbr in oi.nbrs.values_mut() {
-        super::nfsm::publish_nbr_event(
-            &oi.vrf,
-            &oi.name,
-            nbr,
-            nbr.state,
-            super::NfsmState::Down,
-            Some(&"InterfaceDown"),
-        );
         super::nfsm::ospf_nfsm_reset_nbr(nbr);
         nbr.state = super::NfsmState::Down;
     }

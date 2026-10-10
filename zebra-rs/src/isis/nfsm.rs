@@ -49,8 +49,8 @@ pub fn nfsm_hold_timer(nbr: &Neighbor, level: Level) -> Timer {
 }
 
 /// Publish a `zebra.state.v1` adjacency transition. Every site that
-/// sets `nbr.state` or drops a neighbor must call this, or subscribers
-/// miss the change. No-op when nothing changed or nobody watches.
+/// sets `nbr.state` must call this, or subscribers miss the change.
+/// No-op when nothing changed or nobody watches.
 #[allow(clippy::too_many_arguments)]
 pub fn publish_adj_event(
     ctx: &crate::context::ProtoContext,
@@ -74,21 +74,53 @@ pub fn publish_adj_event(
     );
 }
 
-/// Answer a snapshot request with every adjacency on `links`.
-pub fn publish_snapshot(
+/// Publish that an adjacency was discarded, from `old` (its state
+/// before being torn down) with `reason`. Every site that drops a
+/// neighbor entry must call this, or subscribers keep it forever.
+pub fn publish_adj_removed(
+    ctx: &crate::context::ProtoContext,
+    ifname: &str,
+    hostnames: &super::Levels<super::hostname::Hostname>,
+    level: Level,
+    nbr: &Neighbor,
+    old: NfsmState,
+    reason: &str,
+) {
+    use crate::event::{self, EventKind};
+
+    if !event::wants(EventKind::IsisAdjacency) {
+        return;
+    }
+    event::publish_removed(
+        ctx.vrf_id(),
+        ctx.vrf_ifname().unwrap_or_default().to_string(),
+        adj_event(
+            ifname,
+            hostnames,
+            level,
+            nbr,
+            Some(old),
+            NfsmState::Down,
+            reason,
+        ),
+    );
+}
+
+/// Walk every adjacency on `links` into `sink`.
+pub fn publish_state(
     ctx: &crate::context::ProtoContext,
     links: &super::link::IsisLinks,
     hostnames: &super::Levels<super::hostname::Hostname>,
-    req: &crate::event::SnapshotRequest,
+    sink: &dyn crate::event::Sink,
 ) {
-    if !req.wants(crate::event::EventKind::IsisAdjacency) {
+    if !sink.wants(crate::event::EventKind::IsisAdjacency) {
         return;
     }
     let vrf = ctx.vrf_ifname().unwrap_or_default();
     for link in links.values() {
         for level in [Level::L1, Level::L2] {
             for nbr in link.state.nbrs.get(&level).values() {
-                req.publish(
+                sink.publish(
                     ctx.vrf_id(),
                     vrf.to_string(),
                     adj_event(&link.state.name, hostnames, level, nbr, None, nbr.state, ""),
@@ -166,14 +198,13 @@ pub fn nbr_hold_timer_expire(
 
     let was_up = nbr.state == NfsmState::Up;
     let ifindex = nbr.ifindex;
-    publish_adj_event(
+    publish_adj_removed(
         link.ctx,
         &link.state.name,
         link.hostname,
         level,
         nbr,
         nbr.state,
-        NfsmState::Down,
         if release_bfd {
             "HoldTimerExpired"
         } else {
@@ -326,5 +357,28 @@ mod state_event_tests {
             "",
         );
         assert!(next_for(&mut rx, &sys(2).to_string()).is_none());
+    }
+
+    #[tokio::test]
+    async fn removal_is_published_even_from_down() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::IsisAdjacency]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let nbr = Neighbor::new(tx, 2, NetworkType::P2p, sys(3), None);
+        publish_adj_removed(
+            &ProtoContext::default_table_no_rib(),
+            "eth0",
+            &Levels::default(),
+            Level::L2,
+            &nbr,
+            NfsmState::Down,
+            "InterfaceDown",
+        );
+        let removed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|ev| {
+                matches!(&ev.event, Some(event::Event::IsisAdjacency(a))
+                    if a.system_id == sys(3).to_string())
+            })
+            .expect("removal event");
+        assert!(removed.removed);
     }
 }

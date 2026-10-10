@@ -884,6 +884,7 @@ impl Rib {
         let prev_master: Option<u32> = self.links.get(&ifindex).and_then(|l| l.master);
         let now_master: Option<u32> = fib_link.master;
 
+        let mut admin_changed = false;
         if let Some(link) = self.links.get_mut(&fib_link.index) {
             // When link already exists, we are going to check interface up &
             // down event handling.
@@ -914,6 +915,13 @@ impl Rib {
                 let _ = self.tx.send(Message::LinkUp {
                     ifindex: link.index,
                 });
+            } else if link.flags.is_admin_up() != fib_link.flags.is_admin_up() {
+                // Administratively shut or enabled while carrier is
+                // missing: no operational change, so nothing above
+                // records it. Keep the flags current for
+                // `zebra.state.v1` and tell its subscribers.
+                link.flags = fib_link.flags;
+                admin_changed = true;
             }
             // Master / VNI can change on an existing link too — most
             // commonly when a VXLAN device is enslaved or re-enslaved
@@ -993,6 +1001,13 @@ impl Rib {
             if !link.is_up() {
                 self.make_link_up(link.index).await;
             }
+        }
+        if admin_changed {
+            self.publish_ifindex_event(
+                ifindex,
+                crate::event::pb::InterfaceChange::AdminStatus,
+                None,
+            );
         }
 
         // Fan out an MTU change on an already-known link to protocol

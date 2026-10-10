@@ -31,6 +31,12 @@
 //! channels by `seq` and every object's history stays in order. The
 //! private channel closes when the last source has answered, which is
 //! how the subscriber knows the snapshot is complete.
+//!
+//! An object that ceases to exist — a neighbor deleted from config, a
+//! session torn down, a whole protocol instance despawned — gets one
+//! last event with `removed` set. Protocols write a single walk of
+//! their state against [`Sink`]; a snapshot request and the
+//! [`Retiring`] teardown guard are its two sinks.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -119,10 +125,11 @@ impl EventHub {
         });
     }
 
-    fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+    fn publish(&self, vrf_id: u32, vrf: String, event: Event, removed: bool) {
         // Err only means nobody is subscribed right now — the last
         // subscriber left between the caller's `wants` and here.
-        self.stamp(vrf_id, vrf, event, |ev| {
+        self.stamp(vrf_id, vrf, event, |mut ev| {
+            ev.removed = removed;
             let _ = self.tx.send(ev);
         });
     }
@@ -217,18 +224,56 @@ pub struct SnapshotRequest {
     tx: mpsc::UnboundedSender<pb::StateEvent>,
 }
 
-impl SnapshotRequest {
-    /// Whether the requester selected `kind`; skip building the rest.
-    pub fn wants(&self, kind: EventKind) -> bool {
+/// Where a walk of a protocol's current state goes: one event per
+/// object, built only for the families the sink [`wants`](Sink::wants).
+pub trait Sink {
+    fn wants(&self, kind: EventKind) -> bool;
+    fn publish(&self, vrf_id: u32, vrf: String, event: Event);
+}
+
+/// A snapshot request: the objects go to the requester only, as
+/// `snapshot` events.
+impl Sink for SnapshotRequest {
+    fn wants(&self, kind: EventKind) -> bool {
         self.kinds.contains(&kind)
     }
 
-    /// Publish one object's current state to the requester only.
-    pub fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+    fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
         self.hub.stamp(vrf_id, vrf, event, |mut ev| {
             ev.snapshot = true;
             let _ = self.tx.send(ev);
         });
+    }
+}
+
+/// Teardown: the objects go to every subscriber as `removed` events.
+pub struct Removals;
+
+impl Sink for Removals {
+    fn wants(&self, kind: EventKind) -> bool {
+        HUB.wants(kind)
+    }
+
+    fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+        HUB.publish(vrf_id, vrf, event, true);
+    }
+}
+
+/// A protocol instance whose objects can be walked into a [`Sink`].
+pub trait PublishState {
+    fn publish_state(&self, sink: &dyn Sink);
+}
+
+/// Owns a protocol instance for the life of its task. However the
+/// task ends — its loop returning, or the task being aborted when
+/// the instance is despawned — dropping this publishes every object
+/// the instance still holds as removed, so subscribers never keep an
+/// object nobody will report on again.
+pub struct Retiring<T: PublishState>(pub T);
+
+impl<T: PublishState> Drop for Retiring<T> {
+    fn drop(&mut self) {
+        self.0.publish_state(&Removals);
     }
 }
 
@@ -292,7 +337,13 @@ pub fn request_snapshot(kinds: &[EventKind]) -> mpsc::UnboundedReceiver<pb::Stat
 
 /// Publish one state change. `vrf` is empty for the default VRF.
 pub fn publish(vrf_id: u32, vrf: String, event: Event) {
-    HUB.publish(vrf_id, vrf, event);
+    HUB.publish(vrf_id, vrf, event, false);
+}
+
+/// Publish an object's last event: it no longer exists afterwards.
+/// `event` identifies it and carries its final state.
+pub fn publish_removed(vrf_id: u32, vrf: String, event: Event) {
+    HUB.publish(vrf_id, vrf, event, true);
 }
 
 /// The family an event belongs to.
@@ -361,8 +412,8 @@ mod tests {
     fn seq_is_strictly_increasing() {
         let hub = hub();
         let (_interest, mut rx) = hub.register(&[EventKind::BfdSession]);
-        hub.publish(0, String::new(), bfd_event());
-        hub.publish(7, "blue".into(), bfd_event());
+        hub.publish(0, String::new(), bfd_event(), false);
+        hub.publish(7, "blue".into(), bfd_event(), false);
         let first = rx.try_recv().expect("first event");
         let second = rx.try_recv().expect("second event");
         assert_eq!((first.seq, second.seq), (1, 2));
@@ -376,7 +427,7 @@ mod tests {
     #[test]
     fn unobserved_events_are_not_replayed() {
         let hub = hub();
-        hub.publish(0, String::new(), bfd_event());
+        hub.publish(0, String::new(), bfd_event(), false);
         let (_interest, mut rx) = hub.register(&[EventKind::BfdSession]);
         assert!(rx.try_recv().is_err());
     }
@@ -427,9 +478,9 @@ mod tests {
         let mut snap = hub.request_snapshot(&[EventKind::BfdSession]);
         let mut source = source;
         let req = source.rx.try_recv().expect("request");
-        hub.publish(0, String::new(), bfd_event());
+        hub.publish(0, String::new(), bfd_event(), false);
         req.publish(0, String::new(), bfd_event());
-        hub.publish(0, String::new(), bfd_event());
+        hub.publish(0, String::new(), bfd_event(), false);
         drop(req);
         let seqs: Vec<u64> = [
             live.try_recv().unwrap().seq,
@@ -445,7 +496,7 @@ mod tests {
         let hub = hub();
         let (_interest, mut rx) = hub.register(&[EventKind::BfdSession]);
         for _ in 0..CHANNEL_CAPACITY + 1 {
-            hub.publish(0, String::new(), bfd_event());
+            hub.publish(0, String::new(), bfd_event(), false);
         }
         assert!(matches!(
             rx.try_recv(),

@@ -646,13 +646,31 @@ pub fn ospf_nfsm_inactivity_timer<V: OspfVersion>(
     ospf_nfsm_kill_nbr(oi, nbr, oident)
 }
 
+/// Where a neighbor lives, for its `zebra.state.v1` events: the
+/// interface's VRF, name and area.
+#[derive(Clone, Copy)]
+pub struct NbrScope<'a> {
+    pub vrf: &'a crate::event::VrfTag,
+    pub ifname: &'a str,
+    pub area: std::net::Ipv4Addr,
+}
+
+impl<'a> NbrScope<'a> {
+    pub fn of<V: OspfVersion>(link: &'a super::link::OspfLink<V>) -> Self {
+        Self {
+            vrf: &link.vrf,
+            ifname: &link.name,
+            area: link.area_id,
+        }
+    }
+}
+
 /// Publish a `zebra.state.v1` neighbor transition. `reason` explains
-/// a regression (the NFSM event, or why the neighbor was dropped).
-/// Every site that changes or discards a neighbor's state outside
-/// [`ospf_nfsm_change_state`] must call this, or subscribers miss it.
+/// a regression (the NFSM event). Every site that changes a
+/// neighbor's state outside [`ospf_nfsm_change_state`] must call
+/// this, or subscribers miss it.
 pub fn publish_nbr_event<V: OspfVersion>(
-    vrf: &crate::event::VrfTag,
-    ifname: &str,
+    scope: NbrScope,
     nbr: &Neighbor<V>,
     old: NfsmState,
     new: NfsmState,
@@ -664,26 +682,59 @@ pub fn publish_nbr_event<V: OspfVersion>(
         return;
     }
     event::publish(
-        vrf.id,
-        vrf.name.clone(),
-        nbr_event(ifname, nbr, Some(old), new, reason),
+        scope.vrf.id,
+        scope.vrf.name.clone(),
+        nbr_event(scope, nbr, Some(old), new, reason),
     );
 }
 
-/// Answer a snapshot request with every neighbor on `links`.
-pub fn publish_snapshot<V: OspfVersion>(
-    links: &std::collections::BTreeMap<u32, super::link::OspfLink<V>>,
-    req: &crate::event::SnapshotRequest,
+/// Publish that a neighbor was discarded, from `old` (its state
+/// before being torn down) with `reason`. Every site that drops a
+/// neighbor from its interface must call this, or subscribers keep
+/// it forever.
+pub fn publish_nbr_removed<V: OspfVersion>(
+    scope: NbrScope,
+    nbr: &Neighbor<V>,
+    old: NfsmState,
+    reason: &dyn Display,
 ) {
-    if !req.wants(crate::event::EventKind::OspfNeighbor) {
+    use crate::event::{self, EventKind};
+
+    if !event::wants(EventKind::OspfNeighbor) {
+        return;
+    }
+    event::publish_removed(
+        scope.vrf.id,
+        scope.vrf.name.clone(),
+        nbr_event(scope, nbr, Some(old), NfsmState::Down, Some(reason)),
+    );
+}
+
+/// [`publish_nbr_removed`] for every neighbor on `link`, which is
+/// losing them all at once.
+pub fn publish_link_nbrs_removed<V: OspfVersion>(
+    link: &super::link::OspfLink<V>,
+    reason: &dyn Display,
+) {
+    for nbr in link.nbrs.values() {
+        publish_nbr_removed(NbrScope::of(link), nbr, nbr.state, reason);
+    }
+}
+
+/// Walk every neighbor on `links` into `sink`.
+pub fn publish_state<V: OspfVersion>(
+    links: &std::collections::BTreeMap<u32, super::link::OspfLink<V>>,
+    sink: &dyn crate::event::Sink,
+) {
+    if !sink.wants(crate::event::EventKind::OspfNeighbor) {
         return;
     }
     for link in links.values() {
         for nbr in link.nbrs.values() {
-            req.publish(
+            sink.publish(
                 link.vrf.id,
                 link.vrf.name.clone(),
-                nbr_event(&link.name, nbr, None, nbr.state, None),
+                nbr_event(NbrScope::of(link), nbr, None, nbr.state, None),
             );
         }
     }
@@ -692,7 +743,7 @@ pub fn publish_snapshot<V: OspfVersion>(
 /// The `zebra.state.v1` form of a neighbor's state, reached from
 /// `old` (`None` for a snapshot).
 fn nbr_event<V: OspfVersion>(
-    ifname: &str,
+    scope: NbrScope,
     nbr: &Neighbor<V>,
     old: Option<NfsmState>,
     new: NfsmState,
@@ -716,10 +767,11 @@ fn nbr_event<V: OspfVersion>(
         version: if V::IPV6 { 3 } else { 2 },
         router_id: nbr.ident.router_id.to_string(),
         neighbor_address: V::prefix_ip(&nbr.ident.prefix).to_string(),
-        interface: ifname.to_string(),
+        interface: scope.ifname.to_string(),
         old_state: old.map_or(pb::OspfNeighborState::Unspecified, state) as i32,
         new_state: state(new) as i32,
         reason: reason.map(|r| r.to_string()).unwrap_or_default(),
+        area: scope.area.to_string(),
     })
 }
 
@@ -744,7 +796,12 @@ fn ospf_nfsm_change_state<V: OspfVersion>(
         nbr.last_regressive_reason = Some(event);
     }
     let reason = (nbr.state < nbr.ostate).then_some(&event as &dyn Display);
-    publish_nbr_event(oi.vrf, oi.ifname, nbr, nbr.ostate, nbr.state, reason);
+    let scope = NbrScope {
+        vrf: oi.vrf,
+        ifname: oi.ifname,
+        area: oi.area_id,
+    };
+    publish_nbr_event(scope, nbr, nbr.ostate, nbr.state, reason);
 
     if nbr.state < nbr.ostate {
         nbr.options = V::Options::default();
@@ -1086,9 +1143,13 @@ mod state_event_tests {
             id: 7,
             name: "blue".into(),
         };
+        let scope = NbrScope {
+            vrf: &vrf,
+            ifname: "eth1",
+            area: Ipv4Addr::new(0, 0, 0, 1),
+        };
         publish_nbr_event(
-            &vrf,
-            "eth1",
+            scope,
             &nbr,
             NfsmState::Full,
             NfsmState::Down,
@@ -1096,9 +1157,11 @@ mod state_event_tests {
         );
         let (ev, o) = next_for(&mut rx, "10.251.0.1").expect("Full -> Down event");
         assert_eq!((ev.vrf_id, ev.vrf.as_str()), (7, "blue"));
+        assert!(!ev.removed);
         assert_eq!(o.version, 2);
         assert_eq!(o.neighbor_address, "10.0.0.2");
         assert_eq!(o.interface, "eth1");
+        assert_eq!(o.area, "0.0.0.1");
         assert_eq!(o.old_state, pb::OspfNeighborState::Full as i32);
         assert_eq!(o.new_state, pb::OspfNeighborState::Down as i32);
         assert_eq!(o.reason, "InactivityTimer");
@@ -1108,14 +1171,30 @@ mod state_event_tests {
     async fn unchanged_state_is_not_published() {
         let (_interest, mut rx) = event::subscribe(&[EventKind::OspfNeighbor]);
         let nbr = v2_neighbor("10.0.0.3/24", Ipv4Addr::new(10, 251, 0, 2));
-        publish_nbr_event(
-            &VrfTag::default(),
-            "eth1",
-            &nbr,
-            NfsmState::Down,
-            NfsmState::Down,
-            Some(&"InterfaceDown"),
-        );
+        let vrf = VrfTag::default();
+        let scope = NbrScope {
+            vrf: &vrf,
+            ifname: "eth1",
+            area: Ipv4Addr::UNSPECIFIED,
+        };
+        publish_nbr_event(scope, &nbr, NfsmState::Down, NfsmState::Down, None);
         assert!(next_for(&mut rx, "10.251.0.2").is_none());
+    }
+
+    #[tokio::test]
+    async fn removal_is_published_even_from_down() {
+        let (_interest, mut rx) = event::subscribe(&[EventKind::OspfNeighbor]);
+        let nbr = v2_neighbor("10.0.0.4/24", Ipv4Addr::new(10, 251, 0, 3));
+        let vrf = VrfTag::default();
+        let scope = NbrScope {
+            vrf: &vrf,
+            ifname: "eth1",
+            area: Ipv4Addr::UNSPECIFIED,
+        };
+        publish_nbr_removed(scope, &nbr, NfsmState::Down, &"InterfaceRemoved");
+        let (ev, o) = next_for(&mut rx, "10.251.0.3").expect("removal");
+        assert!(ev.removed);
+        assert_eq!(o.reason, "InterfaceRemoved");
+        assert_eq!(o.new_state, pb::OspfNeighborState::Down as i32);
     }
 }

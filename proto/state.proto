@@ -57,6 +57,12 @@ message SubscribeRequest {
 // A subscriber that stops reading long enough to overrun the
 // daemon-side buffer is disconnected with RESOURCE_EXHAUSTED; it
 // should resubscribe (with a snapshot) to resynchronize.
+//
+// Objects are identified by their VRF plus the identity fields of
+// their family (noted on each message). Each protocol runs at most
+// one instance per VRF, so (family, VRF) also names the instance.
+// An object exists from its first event until an event with
+// `removed` set; a client keeping a cache deletes it then.
 message StateEvent {
   // Daemon-wide sequence number, strictly increasing in stream order.
   // It is shared by every family and every subscriber's snapshot, so
@@ -77,6 +83,11 @@ message StateEvent {
   // The snapshot is complete: every source has answered. Carries no
   // event and no VRF.
   bool snapshot_complete = 6;
+  // The object no longer exists after this event: it was deleted
+  // (unconfigured, killed, its interface or instance went away). The
+  // payload identifies it and carries its final state. Not set on
+  // snapshot events.
+  bool removed = 7;
 
   oneof event {
     BgpPeerEvent bgp_peer = 10;
@@ -99,6 +110,7 @@ enum BgpState {
   BGP_STATE_ESTABLISHED = 6;
 }
 
+// Identity: peer_address, or interface for an unnumbered neighbor.
 message BgpPeerEvent {
   // Neighbor transport address.
   string peer_address = 1;
@@ -123,6 +135,7 @@ enum BfdState {
   BFD_STATE_UP = 4;
 }
 
+// Identity: local_address, remote_address, ifindex, multihop.
 message BfdSessionEvent {
   string local_address = 1;
   string remote_address = 2;
@@ -147,6 +160,7 @@ enum OspfNeighborState {
   OSPF_NEIGHBOR_STATE_FULL = 7;
 }
 
+// Identity: version, area, interface, router_id.
 message OspfNeighborEvent {
   // 2 for OSPFv2, 3 for OSPFv3.
   uint32 version = 1;
@@ -158,8 +172,13 @@ message OspfNeighborEvent {
   OspfNeighborState new_state = 6;
   // What moved the neighbor backwards: the RFC 2328 §10.2 event
   // ("InactivityTimer", "SeqNumberMismatch", "KillNbr", …),
-  // "InterfaceDown", or "RouterIdChange". Empty on forward progress.
+  // "InterfaceDown" (link down or OSPF disabled on it),
+  // "InterfaceRemoved", or "RouterIdChange". Empty on forward
+  // progress, and on removals when the whole instance goes away.
   string reason = 7;
+  // Area of the interface the neighbor is on ("0.0.0.0" for the
+  // backbone and for virtual links).
+  string area = 8;
 }
 
 enum InterfaceChange {
@@ -176,15 +195,30 @@ enum InterfaceChange {
   INTERFACE_CHANGE_ADDRESS_ADDED = 5;
   // An address was removed from the interface; see `address`.
   INTERFACE_CHANGE_ADDRESS_DELETED = 6;
+  // The administrative status changed without changing the
+  // operational status (e.g. shut down while carrier was already
+  // lost); see `admin_up`.
+  INTERFACE_CHANGE_ADMIN_STATUS = 7;
 }
 
+// Identity: ifindex (name for display), plus address and
+// prefix_length for an address event. An address is its own object:
+// ADDRESS_ADDED creates it, ADDRESS_DELETED removes it, and a
+// DELETED interface takes its remaining addresses with it.
 message InterfaceEvent {
   string name = 1;
   uint32 ifindex = 2;
   InterfaceChange change = 3;
-  // The address with its prefix length ("10.0.0.1/24"), set on
-  // ADDRESS_ADDED / ADDRESS_DELETED only.
+  // The address ("10.0.0.1"), on ADDRESS_ADDED / ADDRESS_DELETED
+  // only.
   string address = 4;
+  // The address's prefix length, alongside `address`.
+  uint32 prefix_length = 5;
+  // Administratively enabled (IFF_UP), as of this event.
+  bool admin_up = 6;
+  // Operationally up — administratively up with carrier — as of
+  // this event.
+  bool oper_up = 7;
 }
 
 // One SPF computation whose result was installed. Runs superseded
@@ -210,6 +244,7 @@ enum IsisAdjacencyState {
   ISIS_ADJACENCY_STATE_UP = 3;
 }
 
+// Identity: interface, level, system_id.
 message IsisAdjacencyEvent {
   // Neighbor system id ("0000.0000.0001").
   string system_id = 1;
@@ -222,7 +257,8 @@ message IsisAdjacencyEvent {
   IsisAdjacencyState new_state = 6;
   // Why the adjacency regressed: "HoldTimerExpired", "BfdDown",
   // "InterfaceDown", or "NeighborLostUs" (the neighbor's hellos no
-  // longer list this router). Empty on forward progress.
+  // longer list this router), or "InterfaceDown". Empty on forward
+  // progress, and on removals when the whole instance goes away.
   string reason = 7;
 }
 

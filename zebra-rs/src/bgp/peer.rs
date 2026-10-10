@@ -2215,14 +2215,26 @@ pub fn publish_state_event(peer: &Peer, prev_state: State) {
     event::publish(vrf_id, vrf, state_event(peer, Some(prev_state)));
 }
 
-/// Answer a snapshot request with every peer's current state.
-pub fn publish_snapshot(peers: &PeerMap, req: &crate::event::SnapshotRequest) {
-    if !req.wants(crate::event::EventKind::BgpPeer) {
+/// Publish that `peer` was removed from the instance.
+pub fn publish_removed(peer: &Peer) {
+    use crate::event::{self, EventKind};
+
+    if !event::wants(EventKind::BgpPeer) {
+        return;
+    }
+    let (vrf_id, vrf) = event_vrf(peer);
+    event::publish_removed(vrf_id, vrf, state_event(peer, None));
+}
+
+/// Walk every peer's current state into `sink` (a snapshot request,
+/// or removals when the instance is torn down).
+pub fn publish_state(peers: &PeerMap, sink: &dyn crate::event::Sink) {
+    if !sink.wants(crate::event::EventKind::BgpPeer) {
         return;
     }
     for (_, peer) in peers.iter_all() {
         let (vrf_id, vrf) = event_vrf(peer);
-        req.publish(vrf_id, vrf, state_event(peer, None));
+        sink.publish(vrf_id, vrf, state_event(peer, None));
     }
 }
 
@@ -4527,6 +4539,20 @@ mod state_event_tests {
         let peer = test_peer(addr, false);
         publish_state_event(&peer, peer.state);
         assert!(next_for(&mut rx, addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_a_peer_publishes_its_removal() {
+        let addr = "10.250.0.4";
+        let (_interest, mut rx) = event::subscribe(&[EventKind::BgpPeer]);
+        let mut peers = PeerMap::new();
+        peers.insert(addr.parse().unwrap(), test_peer(addr, false));
+        assert!(next_for(&mut rx, addr).is_none(), "insert is not an event");
+        peers.remove(&addr.parse().unwrap());
+        let removed = std::iter::from_fn(|| rx.try_recv().ok()).find(
+            |ev| matches!(&ev.event, Some(event::Event::BgpPeer(p)) if p.peer_address == addr),
+        );
+        assert!(removed.expect("removal event").removed);
     }
 }
 

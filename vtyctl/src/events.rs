@@ -119,11 +119,12 @@ fn format_event(ev: &StateEvent) -> String {
             b.diagnostic,
         ),
         Some(Event::OspfNeighbor(o)) => format!(
-            "{} neighbor {} ({}) on {} {}{}",
+            "{} neighbor {} ({}) on {} area {} {}{}",
             if o.version == 3 { "ospfv3" } else { "ospf" },
             o.router_id,
             o.neighbor_address,
             o.interface,
+            o.area,
             transition(
                 ev.snapshot,
                 ospf_state(o.old_state),
@@ -135,13 +136,16 @@ fn format_event(ev: &StateEvent) -> String {
             let address = if i.address.is_empty() {
                 String::new()
             } else {
-                format!(" {}", i.address)
+                format!(" {}/{}", i.address, i.prefix_length)
             };
+            let up = |b: bool| if b { "up" } else { "down" };
             format!(
-                "interface {} (ifindex {}) {}{address}",
+                "interface {} (ifindex {}) {}{address} (admin {}, oper {})",
                 i.name,
                 i.ifindex,
                 interface_change(i.change),
+                up(i.admin_up),
+                up(i.oper_up),
             )
         }
         Some(Event::SpfRun(r)) => {
@@ -176,8 +180,14 @@ fn format_event(ev: &StateEvent) -> String {
         }
         None => "unknown event".to_string(),
     };
-    let snapshot = if ev.snapshot { " [snapshot]" } else { "" };
-    format!("{secs}.{millis:03} #{}{snapshot}{vrf} {body}", ev.seq)
+    let tag = if ev.snapshot {
+        " [snapshot]"
+    } else if ev.removed {
+        " [removed]"
+    } else {
+        ""
+    };
+    format!("{secs}.{millis:03} #{}{tag}{vrf} {body}", ev.seq)
 }
 
 pub async fn events(host: &str, json: bool, snapshot: bool, families: &[String]) -> Result<()> {
@@ -244,6 +254,7 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "router-id": o.router_id,
             "neighbor-address": o.neighbor_address,
             "interface": o.interface,
+            "area": o.area,
             "old-state": ospf_state(o.old_state),
             "new-state": ospf_state(o.new_state),
             "reason": o.reason,
@@ -254,6 +265,9 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
             "ifindex": i.ifindex,
             "change": interface_change(i.change),
             "address": i.address,
+            "prefix-length": i.prefix_length,
+            "admin-up": i.admin_up,
+            "oper-up": i.oper_up,
         }),
         Some(Event::SpfRun(r)) => json!({
             "type": "spf-run",
@@ -281,6 +295,7 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
         "vrf-id": ev.vrf_id,
         "vrf": ev.vrf,
         "snapshot": ev.snapshot,
+        "removed": ev.removed,
         "event": event,
     })
 }
@@ -297,8 +312,6 @@ mod tests {
             timestamp_ns: 1_700_000_000_123_000_000,
             vrf_id: 10,
             vrf: "blue".into(),
-            snapshot: false,
-            snapshot_complete: false,
             event: Some(Event::BgpPeer(BgpPeerEvent {
                 peer_address: "10.0.0.2".into(),
                 interface: String::new(),
@@ -308,6 +321,7 @@ mod tests {
                 new_state: BgpState::Idle as i32,
                 down_reason: "Hold timer expired".into(),
             })),
+            ..Default::default()
         };
         assert_eq!(
             format_event(&ev),
@@ -338,6 +352,31 @@ mod tests {
         };
         assert_eq!(format_event(&done), "--- snapshot complete");
         assert_eq!(event_json(&done)["snapshot-complete"], true);
+    }
+
+    #[test]
+    fn removals_and_interfaces_render() {
+        let ev = StateEvent {
+            seq: 9,
+            removed: true,
+            event: Some(Event::Interface(pb::InterfaceEvent {
+                name: "eth1".into(),
+                ifindex: 4,
+                change: InterfaceChange::AddressDeleted as i32,
+                address: "10.0.0.1".into(),
+                prefix_length: 24,
+                admin_up: true,
+                oper_up: false,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_event(&ev),
+            "0.000 #9 [removed] interface eth1 (ifindex 4) ADDRESS_DELETED 10.0.0.1/24 (admin up, oper down)"
+        );
+        let json = event_json(&ev);
+        assert_eq!(json["removed"], true);
+        assert_eq!(json["event"]["prefix-length"], 24);
     }
 
     #[test]

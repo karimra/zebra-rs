@@ -7507,7 +7507,7 @@ impl Bgp {
                     self.process_show_msg(msg).await;
                 }
                 Some(req) = snapshot.recv() => {
-                    super::peer::publish_snapshot(&self.peers, &req);
+                    super::peer::publish_state(&self.peers, &req);
                 }
                 Some(msg) = self.policy_rx.recv() => {
                     self.process_policy_msg(msg).await;
@@ -8277,9 +8277,16 @@ impl Bgp {
     }
 }
 
-pub fn serve(mut bgp: Bgp) -> Task<()> {
+impl crate::event::PublishState for Bgp {
+    fn publish_state(&self, sink: &dyn crate::event::Sink) {
+        super::peer::publish_state(&self.peers, sink);
+    }
+}
+
+pub fn serve(bgp: Bgp) -> Task<()> {
     Task::spawn(async move {
-        bgp.event_loop().await;
+        let mut bgp = crate::event::Retiring(bgp);
+        bgp.0.event_loop().await;
     })
 }
 

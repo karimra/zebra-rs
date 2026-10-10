@@ -342,11 +342,16 @@ fn link_event(
     change: crate::event::pb::InterfaceChange,
     address: Option<&IpNet>,
 ) -> crate::event::Event {
+    use super::link_ext::LinkFlagsExt;
+
     crate::event::Event::Interface(crate::event::pb::InterfaceEvent {
         name: link.name.clone(),
         ifindex: link.index,
         change: change as i32,
-        address: address.map(|a| a.to_string()).unwrap_or_default(),
+        address: address.map(|a| a.addr().to_string()).unwrap_or_default(),
+        prefix_length: address.map_or(0, |a| a.prefix_len() as u32),
+        admin_up: link.flags.is_admin_up(),
+        oper_up: link.is_up(),
     })
 }
 
@@ -394,19 +399,30 @@ impl Rib {
     /// also replay links and addresses to subscribers when an
     /// interface moves between VRFs, which is not a change to the
     /// interface itself, so they do not publish.
+    ///
+    /// DELETED and ADDRESS_DELETED end their object, so they go out
+    /// as removals.
     fn publish_link_event(
         &self,
         link: &Link,
         change: crate::event::pb::InterfaceChange,
         address: Option<&IpNet>,
     ) {
-        use crate::event::{self, EventKind};
+        use crate::event::{self, EventKind, pb::InterfaceChange};
 
         if !event::wants(EventKind::Interface) {
             return;
         }
         let (vrf_id, vrf) = self.link_event_vrf(link);
-        event::publish(vrf_id, vrf, link_event(link, change, address));
+        let event = link_event(link, change, address);
+        if matches!(
+            change,
+            InterfaceChange::Deleted | InterfaceChange::AddressDeleted
+        ) {
+            event::publish_removed(vrf_id, vrf, event);
+        } else {
+            event::publish(vrf_id, vrf, event);
+        }
     }
 
     fn link_event_vrf(&self, link: &Link) -> (u32, String) {
@@ -418,13 +434,12 @@ impl Rib {
         )
     }
 
-    /// Answer a `zebra.state.v1` snapshot request: each interface's
-    /// operational state (UP / DOWN), then each of its addresses
-    /// (ADDRESS_ADDED).
-    pub fn publish_snapshot(&self, req: &crate::event::SnapshotRequest) {
+    /// Walk the interfaces into `sink`: each interface's operational
+    /// state (UP / DOWN), then each of its addresses (ADDRESS_ADDED).
+    pub fn publish_state(&self, sink: &dyn crate::event::Sink) {
         use crate::event::{EventKind, pb::InterfaceChange};
 
-        if !req.wants(EventKind::Interface) {
+        if !sink.wants(EventKind::Interface) {
             return;
         }
         for link in self.links.values() {
@@ -434,9 +449,9 @@ impl Rib {
             } else {
                 InterfaceChange::Down
             };
-            req.publish(vrf_id, vrf.clone(), link_event(link, oper, None));
+            sink.publish(vrf_id, vrf.clone(), link_event(link, oper, None));
             for addr in link.addr4.iter().chain(link.addr6.iter()) {
-                req.publish(
+                sink.publish(
                     vrf_id,
                     vrf.clone(),
                     link_event(link, InterfaceChange::AddressAdded, Some(&addr.addr)),
@@ -446,7 +461,7 @@ impl Rib {
     }
 
     /// [`Self::publish_link_event`] for a link known by ifindex.
-    fn publish_ifindex_event(
+    pub(crate) fn publish_ifindex_event(
         &self,
         ifindex: u32,
         change: crate::event::pb::InterfaceChange,
@@ -754,13 +769,13 @@ mod state_event_tests {
     fn events_for(
         rx: &mut tokio::sync::broadcast::Receiver<pb::StateEvent>,
         name: &str,
-    ) -> Vec<pb::InterfaceEvent> {
+    ) -> Vec<(bool, pb::InterfaceEvent)> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let Some(event::Event::Interface(i)) = ev.event
                 && i.name == name
             {
-                out.push(i);
+                out.push((ev.removed, i));
             }
         }
         out
@@ -793,19 +808,52 @@ mod state_event_tests {
         use pb::InterfaceChange::*;
         let got: Vec<_> = events_for(&mut rx, "evtest0")
             .into_iter()
-            .map(|i| (i.change, i.address))
+            .map(|(removed, i)| (i.change, i.address, i.prefix_length, removed))
             .collect();
+        // The deletes end their object, so they arrive as removals.
         let want: Vec<_> = [
-            (Added, ""),
-            (Up, ""),
-            (AddressAdded, "192.0.2.1/24"),
-            (AddressDeleted, "192.0.2.1/24"),
-            (Down, ""),
-            (Deleted, ""),
+            (Added, "", 0, false),
+            (Up, "", 0, false),
+            (AddressAdded, "192.0.2.1", 24, false),
+            (AddressDeleted, "192.0.2.1", 24, true),
+            (Down, "", 0, false),
+            (Deleted, "", 0, true),
         ]
         .into_iter()
-        .map(|(c, a)| (c as i32, a.to_string()))
+        .map(|(c, a, len, removed)| (c as i32, a.to_string(), len, removed))
         .collect();
         assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn every_event_carries_admin_and_oper_status() {
+        use netlink_packet_route::link::LinkFlags;
+
+        let (_interest, mut rx) = event::subscribe(&[EventKind::Interface]);
+        let mut rib = Rib::new(false).expect("rib");
+        // Administratively up, no carrier.
+        let link = Link::from(FibLink {
+            index: 9002,
+            name: "evtest1".into(),
+            flags: LinkFlags::Up,
+            ..Default::default()
+        });
+        rib.api_link_add(&link);
+        rib.links.insert(link.index, link);
+        let (_, i) = events_for(&mut rx, "evtest1").pop().expect("Added");
+        assert!(i.admin_up && !i.oper_up);
+
+        // Shut while carrier is missing: no oper change, but the
+        // admin change is still reported.
+        rib.link_add(FibLink {
+            index: 9002,
+            name: "evtest1".into(),
+            flags: LinkFlags::empty(),
+            ..Default::default()
+        })
+        .await;
+        let (_, i) = events_for(&mut rx, "evtest1").pop().expect("AdminStatus");
+        assert_eq!(i.change, pb::InterfaceChange::AdminStatus as i32);
+        assert!(!i.admin_up && !i.oper_up);
     }
 }

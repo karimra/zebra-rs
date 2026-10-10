@@ -3109,7 +3109,7 @@ impl Isis {
         loop {
             tokio::select! {
                 Some(req) = snapshot.recv() => {
-                    super::nfsm::publish_snapshot(&self.ctx, &self.links, &self.hostname, &req);
+                    super::nfsm::publish_state(&self.ctx, &self.links, &self.hostname, &req);
                 }
                 Some(msg) = self.rib_rx.recv() => {
                     self.process_rib_msg(msg);
@@ -4136,9 +4136,16 @@ fn build_self_originated_purge(
     }
 }
 
-pub fn serve(mut isis: Isis) -> Task<()> {
+impl crate::event::PublishState for Isis {
+    fn publish_state(&self, sink: &dyn crate::event::Sink) {
+        super::nfsm::publish_state(&self.ctx, &self.links, &self.hostname, sink);
+    }
+}
+
+pub fn serve(isis: Isis) -> Task<()> {
     Task::spawn(async move {
-        isis.event_loop().await;
+        let mut isis = crate::event::Retiring(isis);
+        isis.0.event_loop().await;
     })
 }
 

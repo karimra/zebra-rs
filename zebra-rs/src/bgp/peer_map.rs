@@ -79,11 +79,14 @@ impl PeerMap {
     pub fn remove_by_key(&mut self, key: &PeerKey) -> Option<Peer> {
         let &idx = self.map.get(key)?;
         let removed = self.peers[idx].take();
-        if removed.is_some() {
+        if let Some(peer) = &removed {
             // The slot's ident is reused by a same-key re-insert;
             // purge here so the next occupant can't inherit the old
             // session's membership (the ABA hazard).
             self.membership.withdraw(idx);
+            // Every removal path (config delete, interface-neighbor
+            // delete, dynamic-peer reaping) funnels through here.
+            super::peer::publish_removed(peer);
         }
         removed
     }

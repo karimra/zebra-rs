@@ -2237,6 +2237,9 @@ impl<V: OspfVersion> Ospf<V> {
             let area_id = link.area_id;
             let _ = self.tx.send(Message::Disable(ifindex, area_id));
         }
+        // The queued Disable finds the link gone; its neighbors go
+        // with it here.
+        super::nfsm::publish_link_nbrs_removed(link, &"InterfaceRemoved");
         self.links.remove(&ifindex);
     }
 
@@ -6316,13 +6319,11 @@ impl Ospf<Ospfv2> {
 
         if let Some(link) = self.links.get_mut(&ifindex) {
             if let Some(nbr) = link.nbrs.get(&src) {
-                super::nfsm::publish_nbr_event(
-                    &link.vrf,
-                    &link.name,
+                super::nfsm::publish_nbr_removed(
+                    super::nfsm::NbrScope::of(link),
                     nbr,
                     old_state,
-                    NfsmState::Down,
-                    Some(&ev),
+                    &ev,
                 );
             }
             link.nbrs.remove(&src);
@@ -7799,6 +7800,10 @@ impl Ospf<Ospfv2> {
                 let Some(link) = self.links.get_mut(&ifindex) else {
                     return;
                 };
+                // The queued InterfaceDown drops the neighbors; report
+                // them now, while the link still names their area. This
+                // is also the kernel link-down path (`link_down`).
+                super::nfsm::publish_link_nbrs_removed(link, &"InterfaceDown");
                 link.enabled = false;
                 link.area = Ipv4Addr::UNSPECIFIED;
                 link.area_id = Ipv4Addr::UNSPECIFIED;
@@ -8218,7 +8223,7 @@ impl Ospf<Ospfv2> {
         loop {
             tokio::select! {
                 Some(req) = snapshot.recv() => {
-                    super::nfsm::publish_snapshot(&self.links, &req);
+                    super::nfsm::publish_state(&self.links, &req);
                 }
                 Some(msg) = self.rx.recv() => {
                     self.process_msg(msg).await;
@@ -12221,6 +12226,10 @@ impl Ospf<Ospfv3> {
                 let Some(link) = self.links.get_mut(&ifindex) else {
                     return;
                 };
+                // The queued InterfaceDown drops the neighbors; report
+                // them now, while the link still names their area. This
+                // is also the kernel link-down path (`link_down`).
+                super::nfsm::publish_link_nbrs_removed(link, &"InterfaceDown");
                 link.enabled = false;
                 link.area = Ipv4Addr::UNSPECIFIED;
                 link.area_id = Ipv4Addr::UNSPECIFIED;
@@ -13748,13 +13757,11 @@ impl Ospf<Ospfv3> {
 
         if let Some(link) = self.links.get_mut(&ifindex) {
             if let Some(nbr) = link.nbrs.get(&src) {
-                super::nfsm::publish_nbr_event(
-                    &link.vrf,
-                    &link.name,
+                super::nfsm::publish_nbr_removed(
+                    super::nfsm::NbrScope::of(link),
                     nbr,
                     old_state,
-                    NfsmState::Down,
-                    Some(&ev),
+                    &ev,
                 );
             }
             link.nbrs.remove(&src);
@@ -14430,7 +14437,7 @@ impl Ospf<Ospfv3> {
         loop {
             tokio::select! {
                 Some(req) = snapshot.recv() => {
-                    super::nfsm::publish_snapshot(&self.links, &req);
+                    super::nfsm::publish_state(&self.links, &req);
                 }
                 Some(msg) = self.rx.recv() => {
                     self.process_msg(msg).await;
@@ -14492,18 +14499,26 @@ impl Ospf<Ospfv3> {
     }
 }
 
-pub fn serve(mut ospf: Ospf) -> Task<()> {
+impl<V: OspfVersion> crate::event::PublishState for Ospf<V> {
+    fn publish_state(&self, sink: &dyn crate::event::Sink) {
+        super::nfsm::publish_state(&self.links, sink);
+    }
+}
+
+pub fn serve(ospf: Ospf) -> Task<()> {
     Task::spawn(async move {
-        ospf.event_loop().await;
+        let mut ospf = crate::event::Retiring(ospf);
+        ospf.0.event_loop().await;
     })
 }
 
 /// Spawn the v3 instance's main event loop. Symmetric with v2's
 /// `serve`. Entered from `spawn_ospfv3` in `crate::config::ospf`
 /// once the v3 config-schema dispatch hands off an `Ospf<Ospfv3>`.
-pub fn serve_v3(mut ospf: Ospf<Ospfv3>) -> Task<()> {
+pub fn serve_v3(ospf: Ospf<Ospfv3>) -> Task<()> {
     Task::spawn(async move {
-        ospf.event_loop().await;
+        let mut ospf = crate::event::Retiring(ospf);
+        ospf.0.event_loop().await;
     })
 }
 

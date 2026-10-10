@@ -463,13 +463,11 @@ pub fn ospf_hello_recv(
         && existing.ident.router_id != packet.router_id
     {
         let was_adjacent = existing.state >= NfsmState::TwoWay;
-        crate::ospf::nfsm::publish_nbr_event(
-            &oi.vrf,
-            &oi.name,
+        crate::ospf::nfsm::publish_nbr_removed(
+            crate::ospf::nfsm::NbrScope::of(oi),
             existing,
             existing.state,
-            NfsmState::Down,
-            Some(&"RouterIdChange"),
+            &"RouterIdChange",
         );
         oi.nbrs.remove(src);
         if was_adjacent {
