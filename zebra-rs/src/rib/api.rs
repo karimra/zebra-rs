@@ -336,6 +336,20 @@ pub enum RibRx {
     },
 }
 
+/// The `zebra.state.v1` form of an interface change.
+fn link_event(
+    link: &Link,
+    change: crate::event::pb::InterfaceChange,
+    address: Option<&IpNet>,
+) -> crate::event::Event {
+    crate::event::Event::Interface(crate::event::pb::InterfaceEvent {
+        name: link.name.clone(),
+        ifindex: link.index,
+        change: change as i32,
+        address: address.map(|a| a.to_string()).unwrap_or_default(),
+    })
+}
+
 impl Rib {
     /// Resolve a link's VRF id (kernel `rtm_table` value) by
     /// matching its `master` field against the ifindex of each
@@ -386,23 +400,49 @@ impl Rib {
         change: crate::event::pb::InterfaceChange,
         address: Option<&IpNet>,
     ) {
-        use crate::event::{self, EventKind, pb};
+        use crate::event::{self, EventKind};
 
         if !event::wants(EventKind::Interface) {
             return;
         }
-        event::publish(
+        let (vrf_id, vrf) = self.link_event_vrf(link);
+        event::publish(vrf_id, vrf, link_event(link, change, address));
+    }
+
+    fn link_event_vrf(&self, link: &Link) -> (u32, String) {
+        (
             self.link_vrf_id(link),
             super::link::link_vrf_name(self, link)
                 .unwrap_or_default()
                 .to_string(),
-            event::Event::Interface(pb::InterfaceEvent {
-                name: link.name.clone(),
-                ifindex: link.index,
-                change: change as i32,
-                address: address.map(|a| a.to_string()).unwrap_or_default(),
-            }),
-        );
+        )
+    }
+
+    /// Answer a `zebra.state.v1` snapshot request: each interface's
+    /// operational state (UP / DOWN), then each of its addresses
+    /// (ADDRESS_ADDED).
+    pub fn publish_snapshot(&self, req: &crate::event::SnapshotRequest) {
+        use crate::event::{EventKind, pb::InterfaceChange};
+
+        if !req.wants(EventKind::Interface) {
+            return;
+        }
+        for link in self.links.values() {
+            let (vrf_id, vrf) = self.link_event_vrf(link);
+            let oper = if link.is_up() {
+                InterfaceChange::Up
+            } else {
+                InterfaceChange::Down
+            };
+            req.publish(vrf_id, vrf.clone(), link_event(link, oper, None));
+            for addr in link.addr4.iter().chain(link.addr6.iter()) {
+                req.publish(
+                    vrf_id,
+                    vrf.clone(),
+                    link_event(link, InterfaceChange::AddressAdded, Some(&addr.addr)),
+                );
+            }
+        }
     }
 
     /// [`Self::publish_link_event`] for a link known by ifindex.

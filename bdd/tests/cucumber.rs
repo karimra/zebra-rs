@@ -1177,14 +1177,16 @@ async fn poll_bgp_session_state(
     (false, last)
 }
 
-/// Where `vtyctl events --json` in `<scoped>` writes, one event per line.
-fn state_events_file(scoped: &str) -> String {
-    format!("logs/{}.events.log", scoped)
+/// Where a `vtyctl events --json` stream in `<scoped>` writes, one
+/// event per line. `stream` is "events" for the plain subscription and
+/// "snapshot-events" for the one opened with `--snapshot`.
+fn state_events_file(scoped: &str, stream: &str) -> String {
+    format!("logs/{}.{}.log", scoped, stream)
 }
 
 /// This run's events from `<scoped>`, parsed; unparseable lines skipped.
-fn read_state_events(scoped: &str) -> Vec<Value> {
-    fs::read_to_string(state_events_file(scoped))
+fn read_state_events(scoped: &str, stream: &str) -> Vec<Value> {
+    fs::read_to_string(state_events_file(scoped, stream))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -1212,19 +1214,23 @@ fn state_event_matches(event: &Value, spec: &str) -> bool {
     })
 }
 
-#[when(expr = "I start streaming state events in namespace {string}")]
-async fn start_state_events(world: &mut World, namespace: String) {
-    let scoped = world.ns(&namespace);
-    let file = state_events_file(&scoped);
-    // A fresh file per run: the stream is deltas-only, so a line from an
-    // earlier run must never satisfy this run's assertions.
+/// Start `vtyctl events --json [--snapshot]` in `<scoped>` into its
+/// stream file.
+async fn start_event_stream(scoped: &str, stream: &str, snapshot: bool) {
+    let file = state_events_file(scoped, stream);
+    // A fresh file per run: a line from an earlier run must never
+    // satisfy this run's assertions.
     let _ = fs::remove_file(&file);
+    let flag = if snapshot { " --snapshot" } else { "" };
     // `vtyctl events` ends by itself when the daemon goes away and closes
     // the stream, so teardown needs no extra cleanup for it.
     let _child = netns::spawn_in_netns(
-        &scoped,
+        scoped,
         "sh",
-        &["-c", &format!("exec vtyctl events --json > {file} 2>&1")],
+        &[
+            "-c",
+            &format!("exec vtyctl events --json{flag} > {file} 2>&1"),
+        ],
     )
     .await
     .expect("Failed to start vtyctl events");
@@ -1233,30 +1239,49 @@ async fn start_state_events(world: &mut World, namespace: String) {
     println!("✓ Streaming state events from {} into {}", scoped, file);
 }
 
-#[then(expr = "state events in {string} should eventually include {string}")]
-async fn verify_state_event(world: &mut World, namespace: String, spec: String) {
-    let scoped = world.ns(&namespace);
+/// Poll `<scoped>`'s `stream` until an event matches `spec`.
+async fn expect_state_event(scoped: &str, stream: &str, spec: &str) {
     // OSPF reaches Full only after its 40 s wait timer on a broadcast
     // link, so allow well beyond that.
     const ATTEMPTS: u32 = 90;
     for _ in 0..ATTEMPTS {
-        if read_state_events(&scoped)
+        if read_state_events(scoped, stream)
             .iter()
-            .any(|e| state_event_matches(e, &spec))
+            .any(|e| state_event_matches(e, spec))
         {
-            println!("✓ {} streamed an event matching {}", scoped, spec);
+            println!("✓ {} {} streamed one matching {}", scoped, stream, spec);
             return;
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-    let raw = fs::read_to_string(state_events_file(&scoped)).unwrap_or_default();
-    panic!("no event in {scoped} matched `{spec}`; stream so far:\n{raw}");
+    let raw = fs::read_to_string(state_events_file(scoped, stream)).unwrap_or_default();
+    panic!("no {stream} in {scoped} matched `{spec}`; stream so far:\n{raw}");
+}
+
+#[when(expr = "I start streaming state events in namespace {string}")]
+async fn start_state_events(world: &mut World, namespace: String) {
+    start_event_stream(&world.ns(&namespace), "events", false).await;
+}
+
+#[when(expr = "I start streaming state events with a snapshot in namespace {string}")]
+async fn start_snapshot_events(world: &mut World, namespace: String) {
+    start_event_stream(&world.ns(&namespace), "snapshot-events", true).await;
+}
+
+#[then(expr = "state events in {string} should eventually include {string}")]
+async fn verify_state_event(world: &mut World, namespace: String, spec: String) {
+    expect_state_event(&world.ns(&namespace), "events", &spec).await;
+}
+
+#[then(expr = "snapshot events in {string} should eventually include {string}")]
+async fn verify_snapshot_event(world: &mut World, namespace: String, spec: String) {
+    expect_state_event(&world.ns(&namespace), "snapshot-events", &spec).await;
 }
 
 #[then(expr = "state event sequence numbers in {string} should be strictly increasing")]
 async fn verify_state_event_seq(world: &mut World, namespace: String) {
     let scoped = world.ns(&namespace);
-    let seqs: Vec<u64> = read_state_events(&scoped)
+    let seqs: Vec<u64> = read_state_events(&scoped, "events")
         .iter()
         .filter_map(|e| e.get("seq").and_then(Value::as_u64))
         .collect();

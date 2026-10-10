@@ -9,6 +9,9 @@ So that automation can react without polling show commands.
 `vtyctl events --json` subscribes to every event family on z1 before
 any protocol is configured, so the stream must carry the whole
 session bring-up, and then the teardown when z1's link goes down.
+A second subscriber joins once everything is up and asks for a
+snapshot, so it must be told the current state without any change
+happening.
 
 ## Test Topology
 
@@ -35,5 +38,6 @@ session bring-up, and then the teardown when z1's link goes down.
 | Scenario | Result |
 |----------|--------|
 | Session bring-up is streamed | |
+| A late subscriber gets the current state as a snapshot | |
 | Link down is streamed with its consequences | |
 | Teardown topology | |

@@ -38,22 +38,30 @@ enum EventKind {
 message SubscribeRequest {
   // Families to receive. Empty = every family.
   repeated EventKind kinds = 1;
+  // Start with the current state of the selected families: one event
+  // per object (peer, adjacency, session, interface, address) with
+  // `snapshot` set, then a single event with `snapshot_complete` set.
+  // SPF_RUN has no standing state and contributes nothing.
+  bool snapshot = 2;
 }
 
-// One state change.
+// One state change, or one object of a snapshot.
 //
-// The stream carries changes only: it starts with the first change
-// after the subscription is registered, with no snapshot of the
-// current state. Read the current state with `show … json` after
-// subscribing; a change racing that read is then delivered rather
-// than lost.
+// Without `SubscribeRequest.snapshot` the stream carries changes
+// only, from the first change after the subscription is registered.
+// With it, snapshot events and live changes interleave on the stream
+// in `seq` order: each object's snapshot event and its changes arrive
+// in the order they happened, so a client applying them in stream
+// order converges on the daemon's state.
 //
 // A subscriber that stops reading long enough to overrun the
 // daemon-side buffer is disconnected with RESOURCE_EXHAUSTED; it
-// should resubscribe and re-read the current state.
+// should resubscribe (with a snapshot) to resynchronize.
 message StateEvent {
-  // Daemon-wide sequence number, strictly increasing in delivery
-  // order across all families. A gap means events were dropped.
+  // Daemon-wide sequence number, strictly increasing in stream order.
+  // It is shared by every family and every subscriber's snapshot, so
+  // gaps are normal; loss is signalled by RESOURCE_EXHAUSTED instead.
+  // 0 on the `snapshot_complete` marker.
   uint64 seq = 1;
   // Wall-clock time of the change, in nanoseconds since the Unix
   // epoch.
@@ -62,6 +70,13 @@ message StateEvent {
   // name (empty for the default VRF).
   uint32 vrf_id = 3;
   string vrf = 4;
+  // This event describes an object's state at subscription time, not
+  // a change. Its old-state field is UNSPECIFIED; for INTERFACE the
+  // change is UP or DOWN (the current state) or ADDRESS_ADDED.
+  bool snapshot = 5;
+  // The snapshot is complete: every source has answered. Carries no
+  // event and no VRF.
+  bool snapshot_complete = 6;
 
   oneof event {
     BgpPeerEvent bgp_peer = 10;
@@ -213,7 +228,8 @@ message IsisAdjacencyEvent {
 
 // Operational state-change subscription service.
 //
-// Subscribe opens a deltas-only stream of the selected families (see
+// Subscribe opens a stream of the selected families' changes,
+// optionally preceded by a snapshot of their current state (see
 // `StateEvent` for the delivery contract).
 service StateService {
   rpc Subscribe(SubscribeRequest) returns (stream StateEvent) {}

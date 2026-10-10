@@ -65,6 +65,15 @@ fn interface_change(v: i32) -> String {
         .unwrap_or_else(|_| v.to_string())
 }
 
+/// `OLD -> NEW` for a change; `is NEW` for a snapshot object.
+fn transition(snapshot: bool, old: String, new: String) -> String {
+    if snapshot {
+        format!("is {new}")
+    } else {
+        format!("{old} -> {new}")
+    }
+}
+
 /// ` reason: …` suffix, or nothing when there is no reason.
 fn reason_suffix(reason: &str) -> String {
     if reason.is_empty() {
@@ -76,6 +85,9 @@ fn reason_suffix(reason: &str) -> String {
 
 /// One event as a single human-readable line.
 fn format_event(ev: &StateEvent) -> String {
+    if ev.snapshot_complete {
+        return "--- snapshot complete".to_string();
+    }
     let secs = ev.timestamp_ns / 1_000_000_000;
     let millis = (ev.timestamp_ns % 1_000_000_000) / 1_000_000;
     let vrf = if ev.vrf.is_empty() {
@@ -92,30 +104,31 @@ fn format_event(ev: &StateEvent) -> String {
             };
             let reason = reason_suffix(&p.down_reason);
             format!(
-                "bgp neighbor {}{ifname} AS{} {} -> {}{reason}",
+                "bgp neighbor {}{ifname} AS{} {}{reason}",
                 p.peer_address,
                 p.remote_as,
-                bgp_state(p.old_state),
-                bgp_state(p.new_state),
+                transition(ev.snapshot, bgp_state(p.old_state), bgp_state(p.new_state)),
             )
         }
         Some(Event::BfdSession(b)) => format!(
-            "bfd {} -> {}{} {} -> {} diag: {}",
+            "bfd {} -> {}{} {} diag: {}",
             b.local_address,
             b.remote_address,
             if b.multihop { " multihop" } else { "" },
-            bfd_state(b.old_state),
-            bfd_state(b.new_state),
+            transition(ev.snapshot, bfd_state(b.old_state), bfd_state(b.new_state)),
             b.diagnostic,
         ),
         Some(Event::OspfNeighbor(o)) => format!(
-            "{} neighbor {} ({}) on {} {} -> {}{}",
+            "{} neighbor {} ({}) on {} {}{}",
             if o.version == 3 { "ospfv3" } else { "ospf" },
             o.router_id,
             o.neighbor_address,
             o.interface,
-            ospf_state(o.old_state),
-            ospf_state(o.new_state),
+            transition(
+                ev.snapshot,
+                ospf_state(o.old_state),
+                ospf_state(o.new_state)
+            ),
             reason_suffix(&o.reason),
         ),
         Some(Event::Interface(i)) => {
@@ -149,21 +162,25 @@ fn format_event(ev: &StateEvent) -> String {
                 format!(" ({})", a.hostname)
             };
             format!(
-                "isis adjacency {}{host} on {} level-{} {} -> {}{}",
+                "isis adjacency {}{host} on {} level-{} {}{}",
                 a.system_id,
                 a.interface,
                 a.level,
-                isis_state(a.old_state),
-                isis_state(a.new_state),
+                transition(
+                    ev.snapshot,
+                    isis_state(a.old_state),
+                    isis_state(a.new_state)
+                ),
                 reason_suffix(&a.reason),
             )
         }
         None => "unknown event".to_string(),
     };
-    format!("{secs}.{millis:03} #{}{vrf} {body}", ev.seq)
+    let snapshot = if ev.snapshot { " [snapshot]" } else { "" };
+    format!("{secs}.{millis:03} #{}{snapshot}{vrf} {body}", ev.seq)
 }
 
-pub async fn events(host: &str, json: bool, families: &[String]) -> Result<()> {
+pub async fn events(host: &str, json: bool, snapshot: bool, families: &[String]) -> Result<()> {
     let kinds = families
         .iter()
         .map(|f| parse_kind(f).map(|k| k as i32))
@@ -179,7 +196,7 @@ pub async fn events(host: &str, json: bool, families: &[String]) -> Result<()> {
     };
     let mut client = StateServiceClient::new(channel);
     let mut stream = client
-        .subscribe(Request::new(SubscribeRequest { kinds }))
+        .subscribe(Request::new(SubscribeRequest { kinds, snapshot }))
         .await?
         .into_inner();
 
@@ -197,6 +214,9 @@ pub async fn events(host: &str, json: bool, families: &[String]) -> Result<()> {
 /// One event as a JSON object (prost types carry no serde derive).
 fn event_json(ev: &StateEvent) -> serde_json::Value {
     use serde_json::json;
+    if ev.snapshot_complete {
+        return json!({ "snapshot-complete": true });
+    }
     let event = match &ev.event {
         Some(Event::BgpPeer(p)) => json!({
             "type": "bgp-peer",
@@ -260,6 +280,7 @@ fn event_json(ev: &StateEvent) -> serde_json::Value {
         "timestamp-ns": ev.timestamp_ns,
         "vrf-id": ev.vrf_id,
         "vrf": ev.vrf,
+        "snapshot": ev.snapshot,
         "event": event,
     })
 }
@@ -276,6 +297,8 @@ mod tests {
             timestamp_ns: 1_700_000_000_123_000_000,
             vrf_id: 10,
             vrf: "blue".into(),
+            snapshot: false,
+            snapshot_complete: false,
             event: Some(Event::BgpPeer(BgpPeerEvent {
                 peer_address: "10.0.0.2".into(),
                 interface: String::new(),
@@ -290,6 +313,31 @@ mod tests {
             format_event(&ev),
             "1700000000.123 #7 vrf blue bgp neighbor 10.0.0.2 AS65002 ESTABLISHED -> IDLE reason: Hold timer expired"
         );
+    }
+
+    #[test]
+    fn snapshot_objects_and_marker_render() {
+        let ev = StateEvent {
+            seq: 3,
+            snapshot: true,
+            event: Some(Event::BgpPeer(BgpPeerEvent {
+                peer_address: "10.0.0.2".into(),
+                remote_as: 65002,
+                new_state: BgpState::Established as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_event(&ev),
+            "0.000 #3 [snapshot] bgp neighbor 10.0.0.2 AS65002 is ESTABLISHED"
+        );
+        let done = StateEvent {
+            snapshot_complete: true,
+            ..Default::default()
+        };
+        assert_eq!(format_event(&done), "--- snapshot complete");
+        assert_eq!(event_json(&done)["snapshot-complete"], true);
     }
 
     #[test]

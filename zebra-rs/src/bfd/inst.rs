@@ -631,8 +631,11 @@ impl Bfd {
         // runtime, so start it now — this is the point cradle's WatchBfd stream
         // begins and readiness can flip on.
         self.reflectors.ensure_driver();
+        // `zebra.state.v1` snapshot requests, answered from the session table.
+        let mut snapshot = event::snapshot_source();
         loop {
             tokio::select! {
+                Some(req) = snapshot.recv() => self.publish_snapshot(&req),
                 Some(msg) = self.rx.recv() => match msg {
                     Message::Recv { packet, src, dst, ifindex, ttl, multihop } =>
                         self.on_recv(packet, src, dst, ifindex, ttl, multihop),
@@ -1113,13 +1116,37 @@ impl Bfd {
             }
         }
         if event::wants(EventKind::BfdSession) {
-            event::publish(0, String::new(), state_event(key, change));
+            event::publish(
+                0,
+                String::new(),
+                state_event(key, Some(change.from), change.to, change.diag),
+            );
+        }
+    }
+
+    /// Answer a `zebra.state.v1` snapshot request with every session.
+    fn publish_snapshot(&self, req: &event::SnapshotRequest) {
+        if !req.wants(EventKind::BfdSession) {
+            return;
+        }
+        for (key, s) in self.sessions.iter() {
+            req.publish(
+                0,
+                String::new(),
+                state_event(*key, None, s.local_state, s.local_diag),
+            );
         }
     }
 }
 
-/// The `zebra.state.v1` form of a session transition.
-fn state_event(key: SessionKey, change: StateChange) -> event::Event {
+/// The `zebra.state.v1` form of a session's state, reached from
+/// `from` (`None` for a snapshot).
+fn state_event(
+    key: SessionKey,
+    from: Option<bfd_packet::State>,
+    to: bfd_packet::State,
+    diag: bfd_packet::Diag,
+) -> event::Event {
     fn state(s: bfd_packet::State) -> event_pb::BfdState {
         use bfd_packet::State::*;
         match s {
@@ -1134,9 +1161,9 @@ fn state_event(key: SessionKey, change: StateChange) -> event::Event {
         remote_address: key.remote.to_string(),
         ifindex: key.ifindex,
         multihop: key.multihop,
-        old_state: state(change.from) as i32,
-        new_state: state(change.to) as i32,
-        diagnostic: change.diag.to_string(),
+        old_state: from.map_or(event_pb::BfdState::Unspecified, state) as i32,
+        new_state: state(to) as i32,
+        diagnostic: diag.to_string(),
     })
 }
 
@@ -1167,7 +1194,9 @@ mod tests {
             to: bfd_packet::State::Down,
             diag: bfd_packet::Diag::ControlDetectionTimeExpired,
         };
-        let event::Event::BfdSession(ev) = state_event(key, change) else {
+        let event::Event::BfdSession(ev) =
+            state_event(key, Some(change.from), change.to, change.diag)
+        else {
             panic!("expected a BFD session event");
         };
         assert_eq!(ev.local_address, "10.0.0.1");

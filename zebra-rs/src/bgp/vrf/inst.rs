@@ -2031,6 +2031,8 @@ impl BgpVrf {
 
     pub async fn event_loop(&mut self) {
         self.open_listeners().await;
+        // `zebra.state.v1` snapshot requests for this VRF's peers.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             // Priority lane first: keepalive / hold timer events must
             // not queue behind an ingest backlog on `rx` (see the
@@ -2043,6 +2045,9 @@ impl BgpVrf {
             tokio::select! {
                 Some(msg) = self.prx.recv() => {
                     self.process_msg(msg);
+                }
+                Some(req) = snapshot.recv() => {
+                    crate::bgp::peer::publish_snapshot(&self.peers, &req);
                 }
                 msg = self.global_rx.recv() => {
                     match msg {

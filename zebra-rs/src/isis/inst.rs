@@ -3103,8 +3103,14 @@ impl Isis {
                 None => break,
             }
         }
+        // `zebra.state.v1` snapshot requests, answered from the
+        // adjacency tables.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             tokio::select! {
+                Some(req) = snapshot.recv() => {
+                    super::nfsm::publish_snapshot(&self.ctx, &self.links, &self.hostname, &req);
+                }
                 Some(msg) = self.rib_rx.recv() => {
                     self.process_rib_msg(msg);
                 }

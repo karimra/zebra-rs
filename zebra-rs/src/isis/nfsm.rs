@@ -62,11 +62,55 @@ pub fn publish_adj_event(
     new: NfsmState,
     reason: &str,
 ) {
-    use crate::event::{self, EventKind, pb};
+    use crate::event::{self, EventKind};
 
     if old == new || !event::wants(EventKind::IsisAdjacency) {
         return;
     }
+    event::publish(
+        ctx.vrf_id(),
+        ctx.vrf_ifname().unwrap_or_default().to_string(),
+        adj_event(ifname, hostnames, level, nbr, Some(old), new, reason),
+    );
+}
+
+/// Answer a snapshot request with every adjacency on `links`.
+pub fn publish_snapshot(
+    ctx: &crate::context::ProtoContext,
+    links: &super::link::IsisLinks,
+    hostnames: &super::Levels<super::hostname::Hostname>,
+    req: &crate::event::SnapshotRequest,
+) {
+    if !req.wants(crate::event::EventKind::IsisAdjacency) {
+        return;
+    }
+    let vrf = ctx.vrf_ifname().unwrap_or_default();
+    for link in links.values() {
+        for level in [Level::L1, Level::L2] {
+            for nbr in link.state.nbrs.get(&level).values() {
+                req.publish(
+                    ctx.vrf_id(),
+                    vrf.to_string(),
+                    adj_event(&link.state.name, hostnames, level, nbr, None, nbr.state, ""),
+                );
+            }
+        }
+    }
+}
+
+/// The `zebra.state.v1` form of an adjacency's state, reached from
+/// `old` (`None` for a snapshot).
+fn adj_event(
+    ifname: &str,
+    hostnames: &super::Levels<super::hostname::Hostname>,
+    level: Level,
+    nbr: &Neighbor,
+    old: Option<NfsmState>,
+    new: NfsmState,
+    reason: &str,
+) -> crate::event::Event {
+    use crate::event::{self, pb};
+
     fn state(s: NfsmState) -> pb::IsisAdjacencyState {
         match s {
             NfsmState::Down => pb::IsisAdjacencyState::Down,
@@ -79,19 +123,15 @@ pub fn publish_adj_event(
         .get(&nbr.sys_id)
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
-    event::publish(
-        ctx.vrf_id(),
-        ctx.vrf_ifname().unwrap_or_default().to_string(),
-        event::Event::IsisAdjacency(pb::IsisAdjacencyEvent {
-            system_id: nbr.sys_id.to_string(),
-            hostname,
-            interface: ifname.to_string(),
-            level: level.digit() as u32,
-            old_state: state(old) as i32,
-            new_state: state(new) as i32,
-            reason: reason.to_string(),
-        }),
-    );
+    event::Event::IsisAdjacency(pb::IsisAdjacencyEvent {
+        system_id: nbr.sys_id.to_string(),
+        hostname,
+        interface: ifname.to_string(),
+        level: level.digit() as u32,
+        old_state: old.map_or(pb::IsisAdjacencyState::Unspecified, state) as i32,
+        new_state: state(new) as i32,
+        reason: reason.to_string(),
+    })
 }
 
 pub fn nbr_hold_timer_expire(

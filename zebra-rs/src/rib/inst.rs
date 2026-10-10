@@ -5572,8 +5572,12 @@ impl Rib {
         // whether sr0 already exists or needs to be created.
         self.ensure_sr0_dummy().await;
 
+        // `zebra.state.v1` snapshot requests, answered from the link
+        // table — registered after the start-up dump filled it.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             tokio::select! {
+                Some(req) = snapshot.recv() => self.publish_snapshot(&req),
                 Some(msg) = self.rx.recv() => {
                     // Legacy / internal channel. Every `rib_tx`
                     // sender drives the default routing table — the

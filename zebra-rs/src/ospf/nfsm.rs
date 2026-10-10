@@ -658,11 +658,48 @@ pub fn publish_nbr_event<V: OspfVersion>(
     new: NfsmState,
     reason: Option<&dyn Display>,
 ) {
-    use crate::event::{self, EventKind, pb};
+    use crate::event::{self, EventKind};
 
     if old == new || !event::wants(EventKind::OspfNeighbor) {
         return;
     }
+    event::publish(
+        vrf.id,
+        vrf.name.clone(),
+        nbr_event(ifname, nbr, Some(old), new, reason),
+    );
+}
+
+/// Answer a snapshot request with every neighbor on `links`.
+pub fn publish_snapshot<V: OspfVersion>(
+    links: &std::collections::BTreeMap<u32, super::link::OspfLink<V>>,
+    req: &crate::event::SnapshotRequest,
+) {
+    if !req.wants(crate::event::EventKind::OspfNeighbor) {
+        return;
+    }
+    for link in links.values() {
+        for nbr in link.nbrs.values() {
+            req.publish(
+                link.vrf.id,
+                link.vrf.name.clone(),
+                nbr_event(&link.name, nbr, None, nbr.state, None),
+            );
+        }
+    }
+}
+
+/// The `zebra.state.v1` form of a neighbor's state, reached from
+/// `old` (`None` for a snapshot).
+fn nbr_event<V: OspfVersion>(
+    ifname: &str,
+    nbr: &Neighbor<V>,
+    old: Option<NfsmState>,
+    new: NfsmState,
+    reason: Option<&dyn Display>,
+) -> crate::event::Event {
+    use crate::event::{self, pb};
+
     fn state(s: NfsmState) -> pb::OspfNeighborState {
         use NfsmState::*;
         match s {
@@ -675,19 +712,15 @@ pub fn publish_nbr_event<V: OspfVersion>(
             Full => pb::OspfNeighborState::Full,
         }
     }
-    event::publish(
-        vrf.id,
-        vrf.name.clone(),
-        event::Event::OspfNeighbor(pb::OspfNeighborEvent {
-            version: if V::IPV6 { 3 } else { 2 },
-            router_id: nbr.ident.router_id.to_string(),
-            neighbor_address: V::prefix_ip(&nbr.ident.prefix).to_string(),
-            interface: ifname.to_string(),
-            old_state: state(old) as i32,
-            new_state: state(new) as i32,
-            reason: reason.map(|r| r.to_string()).unwrap_or_default(),
-        }),
-    );
+    event::Event::OspfNeighbor(pb::OspfNeighborEvent {
+        version: if V::IPV6 { 3 } else { 2 },
+        router_id: nbr.ident.router_id.to_string(),
+        neighbor_address: V::prefix_ip(&nbr.ident.prefix).to_string(),
+        interface: ifname.to_string(),
+        old_state: old.map_or(pb::OspfNeighborState::Unspecified, state) as i32,
+        new_state: state(new) as i32,
+        reason: reason.map(|r| r.to_string()).unwrap_or_default(),
+    })
 }
 
 fn ospf_nfsm_change_state<V: OspfVersion>(

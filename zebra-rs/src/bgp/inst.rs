@@ -7454,6 +7454,10 @@ impl Bgp {
         // second and no allocation.
         let mut fib_pending_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         fib_pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `zebra.state.v1` snapshot requests, answered from the peer
+        // table. Registered here, once the main loop runs, so a
+        // snapshot never waits on the start-up RIB dump.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             // Priority lane first: keepalive / hold timer events must
             // not queue behind an ingest backlog on `rx` (see the
@@ -7501,6 +7505,9 @@ impl Bgp {
                 }
                 Some(msg) = self.show.rx.recv() => {
                     self.process_show_msg(msg).await;
+                }
+                Some(req) = snapshot.recv() => {
+                    super::peer::publish_snapshot(&self.peers, &req);
                 }
                 Some(msg) = self.policy_rx.recv() => {
                     self.process_policy_msg(msg).await;

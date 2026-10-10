@@ -93,6 +93,13 @@ enum Commands {
         json: bool,
 
         #[arg(
+            short,
+            long,
+            help = "Start with the current state of the selected families"
+        )]
+        snapshot: bool,
+
+        #[arg(
             help = "Event families to stream: bgp, bfd, ospf, isis, interface, spf (omit for all)"
         )]
         families: Vec<String>,
@@ -174,9 +181,10 @@ async fn main() -> Result<()> {
         Some(Commands::Events {
             host,
             json,
+            snapshot,
             families,
         }) => {
-            events::events(endpoint(host, &cli.vty_socket), *json, families).await?;
+            events::events(endpoint(host, &cli.vty_socket), *json, *snapshot, families).await?;
         }
         Some(Commands::Mcp {
             host,

@@ -2206,11 +2206,38 @@ fn fsm_effect(
 /// outside [`fsm_next_state`] must call this, or subscribers miss the
 /// transition. No-op when the state did not change or nobody watches.
 pub fn publish_state_event(peer: &Peer, prev_state: State) {
-    use crate::event::{self, EventKind, pb};
+    use crate::event::{self, EventKind};
 
     if prev_state == peer.state || !event::wants(EventKind::BgpPeer) {
         return;
     }
+    let (vrf_id, vrf) = event_vrf(peer);
+    event::publish(vrf_id, vrf, state_event(peer, Some(prev_state)));
+}
+
+/// Answer a snapshot request with every peer's current state.
+pub fn publish_snapshot(peers: &PeerMap, req: &crate::event::SnapshotRequest) {
+    if !req.wants(crate::event::EventKind::BgpPeer) {
+        return;
+    }
+    for (_, peer) in peers.iter_all() {
+        let (vrf_id, vrf) = event_vrf(peer);
+        req.publish(vrf_id, vrf, state_event(peer, None));
+    }
+}
+
+fn event_vrf(peer: &Peer) -> (u32, String) {
+    (
+        peer.ctx.vrf_id(),
+        peer.ctx.vrf_ifname().unwrap_or_default().to_string(),
+    )
+}
+
+/// The `zebra.state.v1` form of the peer's state, reached from
+/// `prev_state` (`None` for a snapshot).
+fn state_event(peer: &Peer, prev_state: Option<State>) -> crate::event::Event {
+    use crate::event::{self, pb};
+
     fn state(s: State) -> pb::BgpState {
         match s {
             State::Idle => pb::BgpState::Idle,
@@ -2222,7 +2249,7 @@ pub fn publish_state_event(peer: &Peer, prev_state: State) {
         }
     }
     // `fsm` records the cause in `last_reset` before publishing.
-    let down_reason = if prev_state.is_established() {
+    let down_reason = if prev_state.is_some_and(|s| s.is_established()) {
         peer.last_reset
             .as_ref()
             .map(|(reason, _)| reason.as_str().to_string())
@@ -2230,19 +2257,15 @@ pub fn publish_state_event(peer: &Peer, prev_state: State) {
     } else {
         String::new()
     };
-    event::publish(
-        peer.ctx.vrf_id(),
-        peer.ctx.vrf_ifname().unwrap_or_default().to_string(),
-        event::Event::BgpPeer(pb::BgpPeerEvent {
-            peer_address: peer.address.to_string(),
-            interface: peer.ifname.clone().unwrap_or_default(),
-            local_as: peer.local_as,
-            remote_as: peer.remote_as,
-            old_state: state(prev_state) as i32,
-            new_state: state(peer.state) as i32,
-            down_reason,
-        }),
-    );
+    event::Event::BgpPeer(pb::BgpPeerEvent {
+        peer_address: peer.address.to_string(),
+        interface: peer.ifname.clone().unwrap_or_default(),
+        local_as: peer.local_as,
+        remote_as: peer.remote_as,
+        old_state: prev_state.map_or(pb::BgpState::Unspecified, state) as i32,
+        new_state: state(peer.state) as i32,
+        down_reason,
+    })
 }
 
 pub fn fsm(

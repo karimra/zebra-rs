@@ -8212,8 +8212,14 @@ impl Ospf<Ospfv2> {
                 None => break,
             }
         }
+        // `zebra.state.v1` snapshot requests, answered from the
+        // neighbor tables.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             tokio::select! {
+                Some(req) = snapshot.recv() => {
+                    super::nfsm::publish_snapshot(&self.links, &req);
+                }
                 Some(msg) = self.rx.recv() => {
                     self.process_msg(msg).await;
                 }
@@ -14418,8 +14424,14 @@ impl Ospf<Ospfv3> {
                 None => break,
             }
         }
+        // `zebra.state.v1` snapshot requests, answered from the
+        // neighbor tables.
+        let mut snapshot = crate::event::snapshot_source();
         loop {
             tokio::select! {
+                Some(req) = snapshot.recv() => {
+                    super::nfsm::publish_snapshot(&self.links, &req);
+                }
                 Some(msg) = self.rx.recv() => {
                     self.process_msg(msg).await;
                 }

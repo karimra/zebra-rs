@@ -21,12 +21,23 @@
 //!     event::publish(vrf_id, vrf, Event::BgpPeer(…));
 //! }
 //! ```
+//!
+//! A subscriber can also ask for a snapshot of the current state.
+//! Every protocol task that owns state registers a [`SnapshotSource`];
+//! a snapshot request reaches each of them, and each answers from its
+//! own event loop by publishing its objects into a channel private to
+//! that request. Snapshot and live events take their `seq` from the
+//! same counter under the same lock, so the subscriber merges the two
+//! channels by `seq` and every object's history stays in order. The
+//! private channel closes when the last source has answered, which is
+//! how the subscriber knows the snapshot is complete.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 mod service;
 pub use service::{StateServiceServer, StateSubscribeService};
@@ -60,21 +71,28 @@ const KIND_SLOTS: usize = ALL_KINDS.len() + 1;
 static HUB: LazyLock<EventHub> = LazyLock::new(EventHub::new);
 
 pub struct EventHub {
-    /// Last sequence number handed out, together with the sender.
-    /// Allocating the number and sending under one lock makes `seq`
-    /// order equal delivery order across publishing tasks. The lock is
-    /// only taken while some family is watched.
-    tx: Mutex<(u64, broadcast::Sender<pb::StateEvent>)>,
+    /// Last sequence number handed out. Every send happens while this
+    /// is held, so `seq` order is delivery order across publishing
+    /// tasks and across the live and snapshot channels. Only taken
+    /// while someone listens.
+    seq: Mutex<u64>,
+    tx: broadcast::Sender<pb::StateEvent>,
     /// Subscribers selecting each family, indexed by discriminant.
     interest: [AtomicUsize; KIND_SLOTS],
+    /// Snapshot sources: one per running protocol task that owns state.
+    sources: Mutex<HashMap<u64, mpsc::UnboundedSender<SnapshotRequest>>>,
+    next_source: AtomicU64,
 }
 
 impl EventHub {
     fn new() -> Self {
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
-            tx: Mutex::new((0, tx)),
+            seq: Mutex::new(0),
+            tx,
             interest: Default::default(),
+            sources: Mutex::new(HashMap::new()),
+            next_source: AtomicU64::new(0),
         }
     }
 
@@ -82,22 +100,30 @@ impl EventHub {
         self.interest[kind as usize].load(Ordering::Relaxed) > 0
     }
 
-    fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+    /// Stamp `event` with the next `seq` and hand it to `send` while
+    /// the sequence lock is held.
+    fn stamp(&self, vrf_id: u32, vrf: String, event: Event, send: impl FnOnce(pb::StateEvent)) {
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let mut guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
-        let (seq, tx) = &mut *guard;
+        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
         *seq += 1;
-        // Err only means nobody is subscribed right now — the last
-        // subscriber left between the caller's `wants` and here.
-        let _ = tx.send(pb::StateEvent {
+        send(pb::StateEvent {
             seq: *seq,
             timestamp_ns,
             vrf_id,
             vrf,
             event: Some(event),
+            ..Default::default()
+        });
+    }
+
+    fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+        // Err only means nobody is subscribed right now — the last
+        // subscriber left between the caller's `wants` and here.
+        self.stamp(vrf_id, vrf, event, |ev| {
+            let _ = self.tx.send(ev);
         });
     }
 
@@ -107,12 +133,7 @@ impl EventHub {
         &'static self,
         kinds: &[EventKind],
     ) -> (Interest, broadcast::Receiver<pb::StateEvent>) {
-        let rx = self
-            .tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .1
-            .subscribe();
+        let rx = self.tx.subscribe();
         for kind in kinds {
             self.interest[*kind as usize].fetch_add(1, Ordering::Relaxed);
         }
@@ -123,6 +144,91 @@ impl EventHub {
             },
             rx,
         )
+    }
+}
+
+impl EventHub {
+    fn add_source(&'static self) -> SnapshotSource {
+        let id = self.next_source.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        SnapshotSource { hub: self, id, rx }
+    }
+
+    fn request_snapshot(
+        &'static self,
+        kinds: &[EventKind],
+    ) -> mpsc::UnboundedReceiver<pb::StateEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for source in self
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            // A source whose task is gone drops the request unanswered,
+            // which releases its sender just as an answer would.
+            let _ = source.send(SnapshotRequest {
+                hub: self,
+                kinds: kinds.to_vec(),
+                tx: tx.clone(),
+            });
+        }
+        // The caller's copy goes now, so `rx` closes exactly when the
+        // last source has answered.
+        rx
+    }
+}
+
+/// One protocol task's registration for snapshot requests. Register
+/// it when the task enters its main loop, poll [`Self::recv`] there,
+/// and answer each request from the task's own state. Dropping it
+/// (the task ending) unregisters.
+pub struct SnapshotSource {
+    hub: &'static EventHub,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<SnapshotRequest>,
+}
+
+impl SnapshotSource {
+    pub async fn recv(&mut self) -> Option<SnapshotRequest> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for SnapshotSource {
+    fn drop(&mut self) {
+        self.hub
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// A request to publish the current state of `kinds`. Dropping it
+/// (after publishing) tells the requester this source is done.
+pub struct SnapshotRequest {
+    hub: &'static EventHub,
+    kinds: Vec<EventKind>,
+    tx: mpsc::UnboundedSender<pb::StateEvent>,
+}
+
+impl SnapshotRequest {
+    /// Whether the requester selected `kind`; skip building the rest.
+    pub fn wants(&self, kind: EventKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    /// Publish one object's current state to the requester only.
+    pub fn publish(&self, vrf_id: u32, vrf: String, event: Event) {
+        self.hub.stamp(vrf_id, vrf, event, |mut ev| {
+            ev.snapshot = true;
+            let _ = self.tx.send(ev);
+        });
     }
 }
 
@@ -170,6 +276,18 @@ pub fn wants(kind: EventKind) -> bool {
 /// receiver sees every watched family; filter on [`kind_of`].
 pub fn subscribe(kinds: &[EventKind]) -> (Interest, broadcast::Receiver<pb::StateEvent>) {
     HUB.register(kinds)
+}
+
+/// Register the calling protocol task as a snapshot source.
+pub fn snapshot_source() -> SnapshotSource {
+    HUB.add_source()
+}
+
+/// Ask every snapshot source for the current state of `kinds`. The
+/// returned channel carries the answers and closes when all sources
+/// have answered. Subscribe first, so no change falls between.
+pub fn request_snapshot(kinds: &[EventKind]) -> mpsc::UnboundedReceiver<pb::StateEvent> {
+    HUB.request_snapshot(kinds)
 }
 
 /// Publish one state change. `vrf` is empty for the default VRF.
@@ -261,6 +379,65 @@ mod tests {
         hub.publish(0, String::new(), bfd_event());
         let (_interest, mut rx) = hub.register(&[EventKind::BfdSession]);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_reaches_every_source_and_closes_when_answered() {
+        let hub = hub();
+        let mut a = hub.add_source();
+        let mut b = hub.add_source();
+        let mut rx = hub.request_snapshot(&[EventKind::BfdSession]);
+        let ra = a.recv().await.expect("request at a");
+        let rb = b.recv().await.expect("request at b");
+        assert!(ra.wants(EventKind::BfdSession) && !ra.wants(EventKind::BgpPeer));
+        ra.publish(0, String::new(), bfd_event());
+        drop(ra);
+        rb.publish(0, String::new(), bfd_event());
+        drop(rb);
+        let first = rx.recv().await.expect("a's answer");
+        let second = rx.recv().await.expect("b's answer");
+        assert!(first.snapshot && second.snapshot);
+        assert!(first.seq < second.seq);
+        assert!(rx.recv().await.is_none(), "closed once both answered");
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_no_sources_closes_at_once() {
+        let hub = hub();
+        let mut rx = hub.request_snapshot(&[EventKind::BfdSession]);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_source_does_not_hold_the_snapshot_open() {
+        let hub = hub();
+        let source = hub.add_source();
+        // Request queued, then the task ends without answering.
+        let mut rx = hub.request_snapshot(&[EventKind::BfdSession]);
+        drop(source);
+        assert!(rx.recv().await.is_none());
+        assert!(hub.sources.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_and_live_events_share_one_sequence() {
+        let hub = hub();
+        let (_interest, mut live) = hub.register(&[EventKind::BfdSession]);
+        let source = hub.add_source();
+        let mut snap = hub.request_snapshot(&[EventKind::BfdSession]);
+        let mut source = source;
+        let req = source.rx.try_recv().expect("request");
+        hub.publish(0, String::new(), bfd_event());
+        req.publish(0, String::new(), bfd_event());
+        hub.publish(0, String::new(), bfd_event());
+        drop(req);
+        let seqs: Vec<u64> = [
+            live.try_recv().unwrap().seq,
+            snap.try_recv().unwrap().seq,
+            live.try_recv().unwrap().seq,
+        ]
+        .into();
+        assert_eq!(seqs, vec![1, 2, 3]);
     }
 
     #[test]
